@@ -1,7 +1,7 @@
 ## Interface: 16001
 ## Title: Hark
 ## Notes: Proximity voice chat for World of Warcraft: Forever using Blizzard's in-game voice.
-## Author: lisie
+## Author: tomlis20
 ## Version: 0.1.0
 ## SavedVariables: HarkDB
 ## IconTexture: Interface\AddOns\Hark\Media\icon.png
