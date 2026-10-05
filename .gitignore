@@ -1,0 +1,19 @@
+# Addon package builds
+*.zip
+*.tar.gz
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.sublime-workspace
+
+# Local testing
+/build/
+/dist/
