@@ -20,6 +20,8 @@ local function OnLoad()
 		silentRange = 40,       -- yards
 		minVolume = 30,         -- 0-100
 		fadeCurve = "smooth",   -- linear, natural, smooth
+		communityId = nil,      -- set by /hark setcommunity
+		streamId = nil,         -- voice stream ID in the community
 	}
 
 	Hark.db = HarkDB
@@ -27,6 +29,11 @@ local function OnLoad()
 
 	Positions:Init()
 	Voice:Init()
+
+	-- Prompt on zone change after a short delay
+	C_Timer.After(0.5, function()
+		Voice:HandleZoneChange()
+	end)
 end
 
 --- Slash command handler
@@ -35,10 +42,26 @@ local function OnSlashCommand(msg)
 
 	if msg == "" or msg == "help" then
 		Hark:Print("Commands:")
-		Hark:Print("  /hark on|off        Enable/disable proximity voice")
-		Hark:Print("  /hark status        Show current channel and range")
-		Hark:Print("  /hark options       Open settings (not yet)")
-		Hark:Print("  /hark test          Run a quick test (dev)")
+		Hark:Print("  /hark on|off               Enable/disable proximity voice")
+		Hark:Print("  /hark join                 Join proximity voice now")
+		Hark:Print("  /hark leave                Leave proximity voice")
+		Hark:Print("  /hark status               Show current channel and members")
+		Hark:Print("  /hark setcommunity <id>   Set the community to join")
+		Hark:Print("  /hark options              Open settings (coming soon)")
+		return
+	end
+
+	if msg == "join" then
+		if Hark.db.communityId then
+			Voice:JoinCommunity(Hark.db.communityId, Hark.db.streamId or "")
+		else
+			Hark:Print("No community configured. Use /hark setcommunity <id>")
+		end
+		return
+	end
+
+	if msg == "leave" then
+		Voice:Leave()
 		return
 	end
 
@@ -56,6 +79,26 @@ local function OnSlashCommand(msg)
 
 	if msg == "status" then
 		Voice:PrintStatus()
+		return
+	end
+
+	if msg == "setcommunity" then
+		Hark:Print("Usage: /hark setcommunity <clubId> [streamId]")
+		Hark:Print("Example: /hark setcommunity 23111161")
+		return
+	end
+
+	-- /hark setcommunity <id> [stream]
+	if msg:sub(1, 14) == "setcommunity " then
+		local args = msg:sub(15)
+		local clubId, streamId = args:match("^(%S+)%s*(.*)$")
+		if not clubId then
+			Hark:Print("Usage: /hark setcommunity <clubId> [streamId]")
+			return
+		end
+		Hark.db.communityId = clubId
+		Hark.db.streamId = streamId ~= "" and streamId or nil
+		Hark:Print("Community set to " .. clubId .. (streamId and " stream " .. streamId or ""))
 		return
 	end
 
