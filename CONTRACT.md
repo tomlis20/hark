@@ -299,3 +299,50 @@ that it can be registered with `UISpecialFrames` and closed with Escape. No othe
 ### 11.5 Additive UI functions
 
 `UI:ResetPosition()` moves the member panel back to its default place. Options exposes a button for it.
+
+## 12. Diagnostics (added after the reviews)
+
+The addon has to be verifiable on a live client by one player with little time, so it records its
+own evidence to disk. SavedVariables are written on `/reload` and at logout, which makes anything
+stored in `HarkDB` readable from outside the game.
+
+### 12.1 Load order
+
+`Diagnostics.lua` loads last, after `Options.lua`. It owns `/hark selftest` and the probe code.
+The error buffer and the trace buffer live in Core, because they must exist before anything else
+can fail.
+
+### 12.2 New internal HarkDB keys
+
+Internal. Nothing may validate, clear or depend on their shape except Core and Diagnostics.
+
+| Key | Contents |
+|---|---|
+| `errors` | Up to 50 captured Lua errors, newest kept. Repeats bump `count`. |
+| `selftest` | One probe run: client facts, API presence, position, voice, layer and persistence results. |
+| `trace` | Up to 600 rows, newest kept, recording volume passes, messages, layer and voice changes. |
+
+### 12.3 Commands
+
+`/hark selftest` runs every probe and prints a summary. `/hark trace on|off|clear` records a
+timeline; it starts off each session and is never saved.
+
+### 12.4 Exception to rule 1 and section 4
+
+`Voice._SelfTest` calls `C_VoiceChat.SetMemberVolume` directly, which rule 1 otherwise reserves to
+`Voice:SetVolumeFor`. It is allowed only there, only to write back the value it has just read, so
+no member's volume changes, and only to establish whether a GUID-based `PlayerLocation` is accepted
+by this client. A test asserts the heard volume is unchanged. No other diagnostic code may write
+volumes.
+
+### 12.5 Internal hooks
+
+`Hark._RecordError`, `Hark._Trace`, `Hark._TraceWho`, `Hark._diag`, `Positions._Diag`,
+`Voice._SelfTest` and `Options._DiagState` exist for diagnostics and tests only. They are not
+public API and may change.
+
+### 12.6 Reader
+
+`Tests/readselftest.lua` reads a saved `Hark.lua` outside the game and prints the facts, a verdict
+per open question, the error buffer and the trace as a per-member timeline.
+`Tests/pull-selftest.sh` finds the newest such file across every install and runs the reader on it.

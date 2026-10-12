@@ -12,3 +12,4 @@ Positions.lua
 Voice.lua
 UI.lua
 Options.lua
+Diagnostics.lua

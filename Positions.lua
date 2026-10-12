@@ -53,6 +53,7 @@ local seq = 0
 do
 	local ok, now = false, nil
 	if type(GetServerTime) == "function" then ok, now = pcall(GetServerTime) end
+	if not ok and now ~= nil then Hark._RecordError("GetServerTime", now) end
 	now = ok and not Hark.IsSecret(now) and tonumber(now) or nil
 	if now and now == now and now ~= math.huge then seq = math.floor(now * 2) % SEQ_MAX end
 end
@@ -77,6 +78,9 @@ local layerCache = {}     -- [zoneKey] = { layer = n, time = t }
 
 local ticker, scanTicker
 
+-- Diagnostics (/hark selftest): the last SendAddonMessage result per chat type.
+local sendLog = { count = 0, last = {} } -- last[chatType] = { result, seq, t }
+
 ---------------------------------------------------------------------------
 -- Small helpers
 ---------------------------------------------------------------------------
@@ -85,15 +89,38 @@ local function Round(v)
 	return math.floor(v + 0.5)
 end
 
-local function PassResults(ok, ...)
+-- Names for the functions passed to Call, looked up only when one fails.
+local CALL_NAMES = {
+	"C_Map.GetBestMapForUnit", "C_Map.GetMapInfo", "GetPlayerInfoByGUID", "UnitIsVisible",
+	"UnitIsDeadOrGhost", "C_ChatInfo.RegisterAddonMessagePrefix",
+}
+
+local function NameOf(fn)
+	for _, path in ipairs(CALL_NAMES) do
+		local owner, field = path:match("^([%w_]+)%.([%w_]+)$")
+		local v
+		if owner then
+			local t = _G[owner]
+			v = type(t) == "table" and t[field] or nil
+		else
+			v = _G[path]
+		end
+		if v == fn then return path end
+	end
+	return "Positions.Call"
+end
+
+-- A swallowed error still reaches HarkDB.errors (Core, diagnostics).
+local function PassResults(fn, ok, ...)
 	if ok then return ... end
+	Hark._RecordError(NameOf(fn), (...))
 	return nil
 end
 
 -- Protected call: a missing or failing function returns nil instead of erroring.
 local function Call(fn, ...)
 	if type(fn) ~= "function" then return nil end
-	return PassResults(pcall(fn, ...))
+	return PassResults(fn, pcall(fn, ...))
 end
 
 local function MyGUID()
@@ -529,7 +556,11 @@ local function Send(force)
 		bucket.tokens = bucket.tokens - 1
 		-- Forever returns one result code; pre-11.0 clients returned (bool, code).
 		local ok, r1, r2 = pcall(C_ChatInfo.SendAddonMessage, PREFIX, msg, chatType)
+		if not ok then Hark._RecordError("C_ChatInfo.SendAddonMessage", r1) end
 		local result = not ok and -1 or (type(r2) == "number" and r2 or r1)
+		if Hark.IsSecret(result) then result = "secret" end
+		sendLog.last[chatType] = { result = result, seq = seq, t = Hark._diag.ClockNow() }
+		Hark._Trace({ k = "tx", ch = chatType, res = result, seq = seq })
 		if result == RESULT_THROTTLED then
 			bucket.tokens = 0
 			Hark:Debug("send throttled on " .. chatType)
@@ -538,6 +569,7 @@ local function Send(force)
 		end
 	end
 	lastSent.x, lastSent.y, lastSent.instance, lastSent.time = x, y, instance, GetTime()
+	sendLog.count = sendLog.count + 1
 	return true
 end
 
@@ -665,6 +697,11 @@ local function OnAddonMessage(prefix, text, channel, sender)
 	rec.dead = flags:find("d", 1, true) ~= nil
 	rec.channel = channel
 
+	if Hark._diag.traceOn then
+		Hark._TraceWho(guid, sender)
+		Hark._Trace({ k = "rx", g = Hark._diag.ShortGUID(guid), seq = sSeq, x = rec.x, y = rec.y,
+			z = rec.zone, l = rec.layer, ch = channel, f = flags ~= "" and flags or nil })
+	end
 	Hark:Fire("POSITION_RECEIVED", guid)
 end
 
@@ -874,6 +911,28 @@ function Positions:OnLogin()
 	OnZoneMaybeChanged()
 	if not ticker then ticker = C_Timer.NewTicker(TICK, OnTick) end
 	if not scanTicker then scanTicker = C_Timer.NewTicker(LAYER_SCAN_EVERY, ScanNameplates) end
+end
+
+--- Internal, for /hark selftest only (Diagnostics.lua). Plain copies.
+function Positions._Diag()
+	local now = GetTime()
+	local list = {}
+	for guid, s in pairs(samples) do
+		list[#list + 1] = { creature = guid, layer = s.layer, age = math.floor((now - s.time) * 10 + 0.5) / 10 }
+	end
+	local cache = {}
+	for zone, c in pairs(layerCache) do cache[#cache + 1] = { zone = zone, layer = c.layer, age = math.floor(now - c.time) } end
+	local last = {}
+	for chatType, r in pairs(sendLog.last) do last[chatType] = { result = r.result, seq = r.seq, t = r.t } end
+	local seenCount, knownCount = 0, 0
+	for _ in pairs(seen) do seenCount = seenCount + 1 end
+	for _ in pairs(known) do knownCount = knownCount + 1 end
+	return {
+		samples = list, layerCache = cache, zoneKey = zoneKey,
+		sendCount = sendLog.count, lastSend = last, targets = Targets(),
+		forcePending = forcePending, bucketTokens = bucket.tokens,
+		seenCount = seenCount, knownCount = knownCount,
+	}
 end
 
 ns.Positions = Positions

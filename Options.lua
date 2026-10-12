@@ -1105,13 +1105,25 @@ local function RegisterWithSettings()
 	if type(Settings) == "table" and type(Settings.RegisterCanvasLayoutCategory) == "function"
 		and type(Settings.RegisterAddOnCategory) == "function" then
 		local ok, cat = pcall(Settings.RegisterCanvasLayoutCategory, canvas, "Hark")
-		if ok and cat and pcall(Settings.RegisterAddOnCategory, cat) then category = cat end
+		if not ok then Hark._RecordError("Settings.RegisterCanvasLayoutCategory", cat) end
+		if ok and cat then
+			local okAdd, err = pcall(Settings.RegisterAddOnCategory, cat)
+			if okAdd then category = cat else Hark._RecordError("Settings.RegisterAddOnCategory", err) end
+		end
 		return
 	end
 	-- Older clients: the legacy Interface Options list.
 	if type(InterfaceOptions_AddCategory) == "function" then
-		if pcall(InterfaceOptions_AddCategory, canvas) then category = "legacy" end
+		local ok, err = pcall(InterfaceOptions_AddCategory, canvas)
+		if ok then category = "legacy" else Hark._RecordError("InterfaceOptions_AddCategory", err) end
 	end
+end
+
+--- Internal, for /hark selftest only (Diagnostics.lua).
+function Options._DiagState()
+	local kind = false
+	if category == "legacy" then kind = "legacy" elseif category ~= nil then kind = "settings" end
+	return { registered = kind, buildError = buildError, built = panel ~= nil }
 end
 
 -- Asks the game's settings window to show our page. True if the call did not raise.

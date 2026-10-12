@@ -39,8 +39,10 @@ local ABANDON_TTL = 15          -- seconds; also how long a timed-out request ma
 -- Protected API access
 ---------------------------------------------------------------------------
 
-local function PassResults(ok, ...)
+-- A swallowed error still reaches HarkDB.errors (Core, diagnostics).
+local function PassResults(name, ok, ...)
 	if ok then return ... end
+	Hark._RecordError("C_VoiceChat." .. tostring(name), (...))
 	return nil
 end
 
@@ -48,12 +50,13 @@ end
 local function Call(name, ...)
 	local vc = C_VoiceChat
 	if not vc or type(vc[name]) ~= "function" then return nil end
-	return PassResults(pcall(vc[name], ...))
+	return PassResults(name, pcall(vc[name], ...))
 end
 
 local function MakeLocationFromVoice(memberID, chanID)
 	if memberID and chanID and PlayerLocation and PlayerLocation.CreateFromVoiceID then
 		local ok, loc = pcall(PlayerLocation.CreateFromVoiceID, PlayerLocation, memberID, chanID)
+		if not ok then Hark._RecordError("PlayerLocation.CreateFromVoiceID", loc) end
 		if ok and loc then return loc end
 	end
 	return nil
@@ -62,6 +65,7 @@ end
 local function MakeLocationFromGUID(guid)
 	if guid and PlayerLocation and PlayerLocation.CreateFromGUID then
 		local ok, loc = pcall(PlayerLocation.CreateFromGUID, PlayerLocation, guid)
+		if not ok then Hark._RecordError("PlayerLocation.CreateFromGUID", loc) end
 		if ok and loc then return loc end
 	end
 	return nil
@@ -228,8 +232,15 @@ function Voice:SetVolumeFor(guid, volume, memberID, allLocations)
 	-- Record before calling, so nothing lowered is ever unlisted.
 	if Hark.db and volume < Hark.FULL_VOLUME then Hark.db.lowered[guid] = true end
 
-	local okVoice = locVoice ~= nil and pcall(vc.SetMemberVolume, locVoice, volume)
-	local okGUID = locGUID ~= nil and pcall(vc.SetMemberVolume, locGUID, volume)
+	local okVoice, okGUID, err = false, false, nil
+	if locVoice ~= nil then
+		okVoice, err = pcall(vc.SetMemberVolume, locVoice, volume)
+		if not okVoice then Hark._RecordError("C_VoiceChat.SetMemberVolume (voice id)", err) end
+	end
+	if locGUID ~= nil then
+		okGUID, err = pcall(vc.SetMemberVolume, locGUID, volume)
+		if not okGUID then Hark._RecordError("C_VoiceChat.SetMemberVolume (guid)", err) end
+	end
 	if not okVoice and not okGUID then return false end
 
 	local info = members[guid]
@@ -286,7 +297,8 @@ end
 local function ResolveName(guid, memberID)
 	local name = Hark.Positions:GetName(guid)
 	if name then return name end
-	local ok, _, _, _, _, _, n, realm = pcall(GetPlayerInfoByGUID, guid)
+	local ok, first, _, _, _, _, n, realm = pcall(GetPlayerInfoByGUID, guid)
+	if not ok then Hark._RecordError("GetPlayerInfoByGUID", first) end
 	n, realm = Plain(n), Plain(realm)
 	if ok and type(n) == "string" and n ~= "" then
 		if type(realm) == "string" and realm ~= "" then return n .. "-" .. realm end
@@ -304,6 +316,22 @@ local function ScheduleNext()
 		fast = type(speed) == "number" and speed > 0
 	end
 	Voice:RequestPass(fast and PASS_FAST or PASS_SLOW)
+end
+
+-- One /hark trace row per member per pass (only while the trace is on).
+local function TraceMember(guid, info, sent)
+	Hark._TraceWho(guid, info.name)
+	local d = info.distance
+	if d == math.huge then d = "inf" elseif type(d) == "number" then d = math.floor(d + 0.5) end
+	local source = "none"
+	if info.reason == "override" then
+		source = "override"
+	else
+		local pos = Hark.Positions:Get(guid)
+		if pos and pos.source then source = pos.source end
+	end
+	Hark._Trace({ k = "vol", g = Hark._diag.ShortGUID(guid), r = info.reason, d = d,
+		tg = info.target, a = info.volume, set = sent or nil, s = source })
 end
 
 local function RunPass()
@@ -342,10 +370,12 @@ local function RunPass()
 			info.target, info.distance, info.reason = target, distance, reason
 
 			local applied = info.volume
+			local sent = false
 			if applied == nil or math.abs(target - applied) >= MIN_STEP
 				or (target ~= applied and (target == 0 or target == Hark.db.maxVolume)) then
-				Voice:SetVolumeFor(guid, target, memberID)
+				sent = Voice:SetVolumeFor(guid, target, memberID)
 			end
+			if Hark._diag.traceOn then TraceMember(guid, info, sent) end
 		end
 	end
 
@@ -755,6 +785,105 @@ function Voice:OnLogin()
 		end
 		AutoJoin()
 	end)
+end
+
+---------------------------------------------------------------------------
+-- Diagnostics (internal, for /hark selftest only)
+---------------------------------------------------------------------------
+
+--- Probes the active voice channel raw. D is Diagnostics' probe kit:
+-- D.Run(id, callText, fn, ...) -> record, raw results ({ n = count, ... }).
+-- For every member other than the local player, the volume just read is
+-- written back unchanged through the voice-id location (so nobody's volume
+-- changes) and read back through both location forms. This is the one other
+-- place SetMemberVolume is called; the next pass overwrites it anyway.
+function Voice._SelfTest(D)
+	local out = {}
+	local vc = C_VoiceChat
+	local PL = PlayerLocation
+	local function Fn(t, k) return type(t) == "table" and t[k] or nil end
+
+	local rec, raw = D.Run("voice.activeChannel", "C_VoiceChat.GetActiveChannelID()", Fn(vc, "GetActiveChannelID"))
+	rec.hark = { state = state, channelID = channelID, communityId = Hark.db and Hark.db.communityId }
+	out[#out + 1] = rec
+	local chanID = raw and Plain(raw[1]) or channelID
+	if chanID == nil then return out end
+
+	rec, raw = D.Run("voice.channel", "C_VoiceChat.GetChannel(" .. tostring(chanID) .. ")", Fn(vc, "GetChannel"), chanID)
+	out[#out + 1] = rec
+	local channel = raw and raw[1]
+	if Hark.IsSecret(channel) or type(channel) ~= "table" then return out end
+	local list = channel.members
+	if Hark.IsSecret(list) or type(list) ~= "table" then return out end
+
+	local myGUID = Plain(UnitGUID("player"))
+	for i, member in ipairs(list) do
+		local m = { id = "voice.member", index = i, calls = {} }
+		out[#out + 1] = m
+		local function Add(r, raw) m.calls[#m.calls + 1] = r return r, raw end
+		if Hark.IsSecret(member) or type(member) ~= "table" then
+			m.secret = Hark.IsSecret(member)
+		else
+			m.memberID, m.name = D.Clean(member.memberID), D.Clean(member.name)
+			m.isActive, m.isSpeaking = D.Clean(member.isActive), D.Clean(member.isSpeaking)
+			m.secret = D.AnySecret(member.memberID, member.name, member.isActive, member.isSpeaking)
+			local memberID = Plain(member.memberID)
+			local r, rr = Add(D.Run("voice.guid", "GetMemberGUID(memberID, channelID)", Fn(vc, "GetMemberGUID"), memberID, chanID))
+			local guid = rr and Plain(rr[1])
+			if type(guid) ~= "string" then guid = nil end
+			m.guid = guid
+			r, rr = Add(D.Run("voice.local", "IsMemberLocalPlayer(memberID, channelID)", Fn(vc, "IsMemberLocalPlayer"), memberID, chanID))
+			m.isLocal = (guid ~= nil and guid == myGUID) or (rr and Plain(rr[1]) == true) or false
+			if guid then
+				r, rr = Add(D.Run("voice.playerInfo", "GetPlayerInfoByGUID(guid)", GetPlayerInfoByGUID, guid))
+				if rr then m.infoName, m.infoRealm = D.Clean(rr[6]), D.Clean(rr[7]) end
+			end
+			local info = guid and members[guid]
+			if info then m.hark = { volume = info.volume, target = info.target, reason = info.reason, distance = D.Clean(info.distance) } end
+
+			local locVoice, locGUID
+			r, rr = Add(D.Run("voice.locVoice", "PlayerLocation:CreateFromVoiceID(memberID, channelID)", Fn(PL, "CreateFromVoiceID"), PL, memberID, chanID))
+			locVoice = rr and rr[1]
+			if guid then
+				r, rr = Add(D.Run("voice.locGUID", "PlayerLocation:CreateFromGUID(guid)", Fn(PL, "CreateFromGUID"), PL, guid))
+				locGUID = rr and rr[1]
+			end
+			local readVoice, readGUID
+			if locVoice ~= nil then
+				r, rr = Add(D.Run("voice.volVoice", "GetMemberVolume(voice-id location)", Fn(vc, "GetMemberVolume"), locVoice))
+				readVoice = rr and Plain(rr[1])
+				m.volVoice = r.results and r.results[1]
+			end
+			if locGUID ~= nil then
+				r, rr = Add(D.Run("voice.volGUID", "GetMemberVolume(guid location)", Fn(vc, "GetMemberVolume"), locGUID))
+				readGUID = rr and Plain(rr[1])
+				m.volGUID = r.results and r.results[1]
+			end
+
+			if not m.isLocal and locVoice ~= nil then
+				local value = type(readVoice) == "number" and readVoice or (type(readGUID) == "number" and readGUID) or nil
+				if value == nil then
+					m.setSkipped = "no readable volume to write back"
+				else
+					m.setValue = value
+					m.setFrom = type(readVoice) == "number" and "voice" or "guid"
+					Add(D.Run("voice.set", "SetMemberVolume(voice-id location, " .. tostring(value) .. ")",
+						Fn(vc, "SetMemberVolume"), locVoice, value))
+					r, rr = Add(D.Run("voice.backVoice", "GetMemberVolume(voice-id location) after set", Fn(vc, "GetMemberVolume"), locVoice))
+					local back = rr and Plain(rr[1])
+					m.backVoice = r.results and r.results[1]
+					m.matchVoice = type(back) == "number" and math.abs(back - value) < 0.001
+					if locGUID ~= nil then
+						r, rr = Add(D.Run("voice.backGUID", "GetMemberVolume(guid location) after set", Fn(vc, "GetMemberVolume"), locGUID))
+						back = rr and Plain(rr[1])
+						m.backGUID = r.results and r.results[1]
+						m.matchGUID = type(back) == "number" and math.abs(back - value) < 0.001
+					end
+				end
+			end
+		end
+	end
+	return out
 end
 
 ns.Voice = Voice

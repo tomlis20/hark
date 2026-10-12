@@ -124,8 +124,14 @@ local function LoadDB()
 	if type(db.lowered) ~= "table" then db.lowered = {} end
 	-- Owned by UI.lua (CONTRACT.md 10.1): guaranteed to be a table, contents never validated or cleared.
 	if type(db.ui) ~= "table" then db.ui = {} end
+	-- Internal diagnostics (errors, selftest, trace): plain data for reading
+	-- the SavedVariables file outside the game. Never validated beyond type.
+	if type(db.errors) ~= "table" then db.errors = {} end
+	if db.trace ~= nil and type(db.trace) ~= "table" then db.trace = nil end
+	if db.selftest ~= nil and type(db.selftest) ~= "table" then db.selftest = nil end
 	db.dbVersion = Hark.DB_VERSION
 	Hark.db = db
+	if Hark._diag then Hark._diag.FlushPendingErrors() end
 end
 
 ---------------------------------------------------------------------------
@@ -329,7 +335,8 @@ local registeredCVars = {}
 local function EnsureCVar(name)
 	if not registeredCVars[name] then
 		-- Registering again keeps an existing value (that is how they survive a relog).
-		pcall(C_CVar.RegisterCVar, name, "")
+		local ok, err = pcall(C_CVar.RegisterCVar, name, "")
+		if not ok then Hark._RecordError("C_CVar.RegisterCVar", err) end
 		registeredCVars[name] = true
 	end
 end
@@ -341,6 +348,7 @@ local function ReadCVars()
 		local name = PERSIST.CVAR_PREFIX .. i
 		EnsureCVar(name)
 		local ok, value = pcall(C_CVar.GetCVar, name)
+		if not ok then Hark._RecordError("C_CVar.GetCVar", value) end
 		if not ok or type(value) ~= "string" or value == "" then break end
 		parts[#parts + 1] = value
 	end
@@ -357,6 +365,7 @@ local function WriteCVars(payload)
 		local name = PERSIST.CVAR_PREFIX .. i
 		EnsureCVar(name)
 		local ok, res = pcall(C_CVar.SetCVar, name, payload:sub((i - 1) * PERSIST.CHUNK + 1, i * PERSIST.CHUNK))
+		if not ok then Hark._RecordError("C_CVar.SetCVar", res) end
 		if not ok or res == false then return false end
 	end
 	if count < PERSIST.MAX_CHUNKS then -- end marker; Unpack ignores anything past the length anyway
@@ -420,7 +429,8 @@ local function WriteMacro(payload, db)
 	if index then
 		local _, _, current = GetMacroInfo(index)
 		if current == text then persist.macroState = "ok" return true end
-		local ok = pcall(EditMacro, index, nil, nil, text)
+		local ok, err = pcall(EditMacro, index, nil, nil, text)
+		if not ok then Hark._RecordError("EditMacro", err) end
 		persist.macroState = ok and "ok" or "edit failed"
 		return ok
 	end
@@ -432,7 +442,8 @@ local function WriteMacro(payload, db)
 		persist.macroState = "no free account macro slot"
 		return false
 	end
-	local ok = pcall(CreateMacro, PERSIST.MACRO_NAME, PERSIST.MACRO_ICON, text, nil)
+	local ok, err = pcall(CreateMacro, PERSIST.MACRO_NAME, PERSIST.MACRO_ICON, text, nil)
+	if not ok then Hark._RecordError("CreateMacro", err) end
 	persist.macroState = ok and "ok" or "create failed"
 	return ok
 end
@@ -729,6 +740,158 @@ function Hark:Debug(msg)
 	end
 end
 
+---------------------------------------------------------------------------
+-- Diagnostics: error capture and trace buffer (internal, not in CONTRACT.md)
+---------------------------------------------------------------------------
+-- Every Lua error any addon raises goes to the client's error handler, whether
+-- or not the scriptErrors CVar shows it. Hark wraps that handler and appends
+-- each error to HarkDB.errors, so it can be read from the SavedVariables file
+-- after a /reload or logout. Hark's own protected calls, which swallow their
+-- errors, report them through Hark._RecordError. Diagnostics.lua adds the
+-- /hark selftest and /hark trace commands on top.
+
+local DIAG = {
+	ERRORS_MAX = 50,     -- newest kept
+	MESSAGE_MAX = 600,   -- characters
+	STACK_MAX = 1200,
+	TRACE_MAX = 600,     -- rows, newest kept
+}
+
+local diag = {
+	traceOn = false,     -- session only, never saved
+	pending = {},        -- errors raised before HarkDB is loaded
+	inHandler = false,
+	wrapper = nil,       -- our error handler, once installed
+	traceWho = {},       -- [guid] = name already written as a "who" row this trace
+	CONFIG = DIAG,
+}
+Hark._diag = diag
+
+--- GetTime() rounded to 0.1 s (nil if unreadable). Trace rows and errors carry it.
+local function ClockNow()
+	if type(GetTime) ~= "function" then return nil end
+	local ok, t = pcall(GetTime)
+	if not ok or Hark.IsSecret(t) or type(t) ~= "number" then return nil end
+	return math.floor(t * 10 + 0.5) / 10
+end
+diag.ClockNow = ClockNow
+
+local function Clip(v, max)
+	if v == nil then return nil end
+	if Hark.IsSecret(v) then return "<secret>" end
+	local ok, s = pcall(tostring, v)
+	if not ok or type(s) ~= "string" then return "<unprintable>" end
+	if #s > max then s = s:sub(1, max) .. "..." end
+	return s
+end
+
+local function ErrorBuffer()
+	local db = Hark.db
+	if db then
+		if type(db.errors) ~= "table" then db.errors = {} end
+		return db.errors
+	end
+	return diag.pending
+end
+
+local function AppendError(where, message, stack)
+	local buf = ErrorBuffer()
+	local msg = Clip(message, DIAG.MESSAGE_MAX) or "nil"
+	where = Clip(where, 80) or "?"
+	-- The same error repeating (an OnUpdate, a ticker) is one entry with a count.
+	for _, e in ipairs(buf) do
+		if type(e) == "table" and e.message == msg and e.where == where then
+			e.count = (tonumber(e.count) or 1) + 1
+			e.lastTime, e.lastT = Now(), ClockNow()
+			return
+		end
+	end
+	buf[#buf + 1] = { time = Now(), t = ClockNow(), where = where, message = msg,
+		stack = Clip(stack, DIAG.STACK_MAX), count = 1 }
+	while #buf > DIAG.ERRORS_MAX do table.remove(buf, 1) end
+end
+
+--- Internal: record an error a protected call swallowed. Never raises.
+-- where: the function that failed, e.g. "C_VoiceChat.GetChannel".
+function Hark._RecordError(where, message)
+	local stack
+	if type(debugstack) == "function" then
+		local ok, s = pcall(debugstack, 2)
+		if ok then stack = s end
+	end
+	pcall(AppendError, where, message, stack)
+end
+
+function diag.FlushPendingErrors()
+	if not Hark.db or #diag.pending == 0 then return end
+	local list = diag.pending
+	diag.pending = {}
+	for _, e in ipairs(list) do
+		local buf = ErrorBuffer()
+		buf[#buf + 1] = e
+		while #buf > DIAG.ERRORS_MAX do table.remove(buf, 1) end
+	end
+end
+
+--- Wrap the client's error handler (again, if something replaced ours). The
+-- original handler still runs for every error, so the client's own display
+-- and other error addons behave exactly as before.
+function diag.InstallErrorHandler()
+	if type(geterrorhandler) ~= "function" or type(seterrorhandler) ~= "function" then return false end
+	local ok, original = pcall(geterrorhandler)
+	if not ok then return false end
+	if original ~= nil and original == diag.wrapper then return true end
+	local wrapper = function(message, ...)
+		if not diag.inHandler then
+			diag.inHandler = true
+			local stack
+			if type(debugstack) == "function" then
+				local okStack, s = pcall(debugstack, 2)
+				if okStack then stack = s end
+			end
+			pcall(AppendError, "error handler", message, stack)
+			diag.inHandler = false
+		end
+		if type(original) == "function" then return original(message, ...) end
+	end
+	if pcall(seterrorhandler, wrapper) then
+		diag.wrapper = wrapper
+		return true
+	end
+	return false
+end
+
+--- "Player-4184-0A1B2C3D" -> "0A1B2C3D" (nil stays nil).
+function diag.ShortGUID(guid)
+	if type(guid) ~= "string" or Hark.IsSecret(guid) then return nil end
+	return guid:match("%-(%x+)$") or guid
+end
+
+--- Internal: append one row to HarkDB.trace while /hark trace is on.
+function Hark._Trace(row)
+	if not diag.traceOn or not Hark.db or type(row) ~= "table" then return end
+	local buf = Hark.db.trace
+	if type(buf) ~= "table" then
+		buf = {}
+		Hark.db.trace = buf
+	end
+	if row.t == nil then row.t = ClockNow() end
+	buf[#buf + 1] = row
+	while #buf > DIAG.TRACE_MAX do table.remove(buf, 1) end
+end
+
+--- Internal: a "who" row the first time a GUID (or its name) shows up in a trace.
+function Hark._TraceWho(guid, name)
+	if not diag.traceOn or type(guid) ~= "string" then return end
+	if Hark.IsSecret(name) or type(name) ~= "string" then name = nil end
+	local known = diag.traceWho[guid]
+	if known ~= nil and (known == name or name == nil) then return end
+	diag.traceWho[guid] = name or false
+	Hark._Trace({ k = "who", g = diag.ShortGUID(guid), guid = guid, n = name })
+end
+
+diag.InstallErrorHandler()
+
 local function SafeInit(module, name)
 	if module and type(module.Init) == "function" then
 		local ok, err = pcall(module.Init, module)
@@ -755,6 +918,8 @@ local function PrintHelp()
 	Hark:Print("  /hark backup                   Where settings were loaded from, and the backup copies")
 	Hark:Print("  /hark show | hide | toggle     Show or hide the member panel")
 	Hark:Print("  /hark options                  Open settings")
+	Hark:Print("  /hark selftest                 Probe the client and save the results (then /reload)")
+	Hark:Print("  /hark trace on | off | clear   Record volumes and messages to the saved variables")
 end
 
 local function OnSlashCommand(msg)
@@ -829,6 +994,12 @@ local function OnSlashCommand(msg)
 		else
 			Hark:Print("The panel is not available on this client.")
 		end
+	elseif cmd == "selftest" or cmd == "trace" then
+		if Hark.Diagnostics and type(Hark.Diagnostics.OnSlash) == "function" then
+			Hark.Diagnostics:OnSlash(cmd, rest)
+		else
+			Hark:Print("Diagnostics are not available.")
+		end
 	elseif cmd == "options" or cmd == "config" then
 		if Hark.Options and type(Hark.Options.Open) == "function" then
 			Hark.Options:Open()
@@ -887,6 +1058,8 @@ frame:SetScript("OnEvent", function(self, event, arg1)
 		persist.loadedFired = true
 		Hark:Fire("LOADED")
 	elseif event == "PLAYER_LOGIN" then
+		-- An error addon loaded after Hark may have replaced the handler: wrap it too.
+		diag.InstallErrorHandler()
 		TryRestore()
 		Hark:Print("Loaded (v" .. Hark.version .. "). Type /hark help for commands.")
 		if Hark.Voice then Hark.Voice:OnLogin() end

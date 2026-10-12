@@ -51,6 +51,8 @@ and name it `Hark`.
 | `/hark layer` | Show the detected zone-copy (layer) id |
 | `/hark backup` | Where settings loaded from, and the backup state |
 | `/hark debug` | Toggle debug output |
+| `/hark selftest` | Probe the client and save the raw answers (then `/reload`) |
+| `/hark trace on` / `off` / `clear` | Record volumes and position messages to the saved variables |
 
 `/ha` works as a short form of `/hark`.
 
@@ -90,6 +92,7 @@ Open the panel with `/hark options`. The ones that matter most:
 Tests/run          # the whole suite, headless, about a second
 Tests/run -v       # with addon output and Lua errors
 Tests/run <text>   # only tests whose name matches
+lua5.1 Tests/readselftest.lua <WTF/Account/ACCOUNT/SavedVariables/Hark.lua>   # self-test, errors, trace
 ```
 
 The suite runs the real addon against a fake WoW client, with several simulated players sharing a

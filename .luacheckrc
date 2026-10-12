@@ -87,6 +87,8 @@ read_globals = {
 
 	-- misc
 	"Enum", "C_AddOns", "GetAddOnMetadata", "IsAddOnLoaded",
+	-- read by Diagnostics.lua (/hark selftest) and Positions.lua
+	"GetBuildInfo", "UISpecialFrames", "UnitIsVisible", "HarkOptionsFrame",
 }
 
 -- The test harness runs under plain Lua 5.1/LuaJIT, not inside WoW.

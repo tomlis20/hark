@@ -287,8 +287,11 @@ function WowApi.Build(client)
 	api.ChatFrame1 = api.DEFAULT_CHAT_FRAME
 	-- The default handler reports the error and returns; it does not throw.
 	local errorHandler = function(e)
+		-- Client:Call already recorded an error it is dispatching (see world.lua).
+		if client.dispatchingError then return end
 		client.errors[#client.errors + 1] = { client = client.name, context = "geterrorhandler", message = tostring(e), time = clock.now }
 	end
+	client.defaultErrorHandler = errorHandler
 	api.geterrorhandler = function() return errorHandler end
 	api.seterrorhandler = function(h) errorHandler = h end
 

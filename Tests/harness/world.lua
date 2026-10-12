@@ -565,6 +565,16 @@ function Client:Call(context, fn, ...)
 	if not ok then
 		local rec = { client = self.name, context = context, message = err.message, trace = err.trace, time = self.world.clock.now }
 		self.errors[#self.errors + 1] = rec
+		-- As in game, an uncaught error goes to the current error handler, so an
+		-- addon that wrapped it (seterrorhandler) sees it too. The default
+		-- handler does not record it a second time.
+		local api = self.api
+		local handler = api and type(api.geterrorhandler) == "function" and api.geterrorhandler()
+		if type(handler) == "function" and handler ~= self.defaultErrorHandler then
+			self.dispatchingError = true
+			pcall(handler, err.message)
+			self.dispatchingError = false
+		end
 		if self.world.options.echo then
 			io.stdout:write("    [lua error] ", self.name, " ", context, ": ", rec.message, "\n")
 		end
