@@ -17,3 +17,6 @@ Thumbs.db
 # Local testing
 /build/
 /dist/
+
+# Lua compiler output from syntax checks
+luac.out

@@ -1,64 +1,100 @@
 # Hark
 
-Proximity voice chat for World of Warcraft: Forever using Blizzard's in-game voice.
+Proximity voice chat for **World of Warcraft: Forever**, built on Blizzard's own in-game voice.
 
-## Overview
+You join one community with voice enabled. Hark then turns everyone's volume up or down by how
+far away they are: full volume close by, fading with distance, silent once they are out of range.
+No external programs, nothing outside the addon sandbox.
 
-Hark lets players in the same zone hear each other through voice chat, with volume falling off based on distance. Everyone within earshot is audible; those beyond range fade to silence.
+## How it works
 
-- **Works on any ruleset** (Normal, PvP, RP, Hardcore)
-- **No external programs** — uses Blizzard voice directly
-- **Opt-in** — join a community once, then Hark prompts you on zone entry
-- **Configurable ranges** — adjust how far you can hear and when voices fade
+Blizzard gives addons no way to put a stranger into a voice channel, so Hark does not try. Instead
+everyone opts in once by joining a shared community, and Hark changes only the per-player volume
+sliders the client already exposes. Positions are shared over hidden addon messages.
 
-## Installation
+## Requirements
 
-1. Download or clone this repo into your WoW Forever `Interface\AddOns\` folder
-2. Name the folder `Hark` (not `hark-main` or similar)
-3. Restart WoW or type `/reload`
-4. Type `/hark help` to see commands
+- World of Warcraft: Forever (interface 16001).
+- A community with voice enabled that everyone has joined.
+- Everyone needs Hark installed. A player without it still hears you; you cannot place them.
 
-## Quick Start
+## Install
 
-1. **Join or create a community** in-game (Communities tab, press **J**)
-   - Name: something like "Proximity Voice" or "Earshot"
-   - Invite your guildmates or friends
-   - Enable voice chat for the community
+```bash
+./install.sh
+```
 
-2. **Configure Hark** to use that community (settings coming soon)
-   - For now, see the `Core.lua` file for the default community ID
+This links the repository into every Forever addons folder it finds, so edits are live after a
+`/reload`. Use `./install.sh --copy` if your setup ignores links, and `./install.sh --status` to
+see what is installed. To install by hand, copy this folder into `_classic_beta_/Interface/AddOns/`
+and name it `Hark`.
 
-3. **Move between zones** — Hark will prompt you to join proximity voice
-   - Accept the prompt, and you'll hear others in the channel
-   - Leave the zone, and you'll automatically leave voice
+## Quick start
+
+1. Create or join a community and enable voice for it. Everyone who wants to be heard joins it.
+2. In game, run `/hark communities` to list your communities and their ids.
+3. Run `/hark setcommunity <id>` with the id you want.
+4. Run `/hark join`. After that Hark joins on its own at login.
 
 ## Commands
 
-- `/hark` or `/ha` — show help
-- `/hark on|off` — enable/disable proximity voice
-- `/hark status` — show current channel and member count
-- `/hark options` — open settings (not yet implemented)
+| Command | What it does |
+|---|---|
+| `/hark` | List all commands |
+| `/hark on` / `off` | Turn proximity volumes on or off |
+| `/hark join` / `leave` | Join or leave the community voice channel |
+| `/hark status` | Channel, members, distances and volumes |
+| `/hark communities` | List your communities and their ids |
+| `/hark setcommunity <id> [stream]` | Choose the community to use |
+| `/hark show` / `hide` / `toggle` | Show or hide the member panel |
+| `/hark options` | Open the settings panel |
+| `/hark layer` | Show the detected zone-copy (layer) id |
+| `/hark backup` | Where settings loaded from, and the backup state |
+| `/hark debug` | Toggle debug output |
 
-## Known Limitations
+`/ha` works as a short form of `/hark`.
 
-- **One community per session** — you cannot hop between communities while moving
-- **Everyone needs the addon** — non-addon players hear the whole channel at normal volume
-- **Voice channel cap unknown** — if the community voice fills up, Hark will retry
-- **No layering awareness yet** — players on different layers may be heard as if they are nearby
+## Settings
+
+Open the panel with `/hark options`. The ones that matter most:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| Full voice range | 15 yd | Heard at full volume within this distance |
+| Silent range | 40 yd | Completely silent at or beyond this distance |
+| Min volume | 30 | Volume just inside the silent range |
+| Fade curve | smooth | `linear`, `natural` or `smooth` |
+| Hear unknown | off | Whether to hear members whose position you cannot get |
+| Layer aware | on | Silence players confirmed to be on another layer of your zone |
+
+## Known limitations
+
+- **Positions reach your guild and your group only.** Custom chat channels do not deliver messages
+  between players on this client, so a community member who is in neither your guild nor your group
+  cannot send you their position. Hark falls back to ranging anyone your client can actually see,
+  through nameplates, your target or your mouseover, but whether the client allows that for players
+  outside your group is still unconfirmed. Until it is, treat Hark as proximity voice for your guild
+  or group.
+- **Layers.** Two players in different copies of the same zone are silenced, but only when both
+  layers are confirmed. Hark confirms a layer from nearby creatures, so it needs a moment after a
+  zone change.
+- **Saved settings on the beta.** The beta client may not read saved variables back after a relog.
+  Hark keeps its own backup in client settings and one account macro named `HarkSettings`, so your
+  configuration survives. Check with `/hark backup`.
+- **Volumes are restored, always.** Disabling Hark, leaving voice, or logging out puts everyone
+  back to full volume. Anyone left quiet by a crash is restored at the next login.
 
 ## Development
 
-**Beta test checklist (by 21 October 2026):**
-- [ ] Test 1: Addon messages on temporary player-made channel deliver to strangers in the same zone
-- [ ] Test 2: Voice channel cap and error handling
-- [ ] Test 3: Layer ID detection from NPC GUIDs
+```bash
+Tests/run          # the whole suite, headless, about a second
+Tests/run -v       # with addon output and Lua errors
+Tests/run <text>   # only tests whose name matches
+```
 
-**Road map:**
-1. ✅ Core position sharing and volume attenuation
-2. ⏳ UI panel (members, quick mute, status)
-3. ⏳ Options menu (community selection, range settings)
-4. ⏳ Layer detection and handling
-5. ⏳ Mumble positional audio integration (optional, separate build)
+The suite runs the real addon against a fake WoW client, with several simulated players sharing a
+controllable clock, a message bus and a voice service. `CONTRACT.md` is the module contract and
+describes the public surface, the settings schema, the callback events and the wire format.
 
 ## License
 

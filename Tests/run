@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+# Run the Hark headless test suite.  Usage: Tests/run [-v] [name-filter]
+# WoW runs Lua 5.1, so prefer a 5.1 interpreter.
+here="$(cd "$(dirname "$0")" && pwd)"
+for lua in "${LUA:-}" lua5.1 luajit lua-5.1 lua51; do
+	[ -n "$lua" ] && command -v "$lua" >/dev/null 2>&1 && exec "$lua" "$here/runner.lua" "$@"
+done
+echo "No Lua 5.1 interpreter found (tried lua5.1, luajit). See Tests/README.md." >&2
+exit 2
