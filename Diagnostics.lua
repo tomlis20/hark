@@ -421,6 +421,181 @@ function Diagnostics:SelfTest()
 end
 
 ---------------------------------------------------------------------------
+-- /hark joindiag
+---------------------------------------------------------------------------
+-- Records the pre-join facts, listens to every VOICE_CHAT_* event the client
+-- accepts for JOINDIAG_SECONDS, calls Voice:Join(), and stores it all in
+-- HarkDB.joindiag (CONTRACT.md 13). Voice's own step log (HarkDB.joinlog)
+-- runs regardless; the entries from this window are copied in as well.
+
+local JOINDIAG_SECONDS = 20
+local JOINDIAG_EVENTS_MAX = 200
+local JOINDIAG_RETRY_AT = 6   -- seconds: one string-form retry if the numeric request drew no event at all
+
+-- Every VOICE_CHAT_* event in the Forever 1.60.1 API docs. Names the client
+-- refuses are recorded as rejected, not raised.
+local VOICE_EVENTS = {
+	"VOICE_CHAT_ACTIVE_INPUT_DEVICE_UPDATED", "VOICE_CHAT_ACTIVE_OUTPUT_DEVICE_UPDATED",
+	"VOICE_CHAT_AUDIO_CAPTURE_ENERGY", "VOICE_CHAT_AUDIO_CAPTURE_STARTED", "VOICE_CHAT_AUDIO_CAPTURE_STOPPED",
+	"VOICE_CHAT_CHANNEL_ACTIVATED", "VOICE_CHAT_CHANNEL_DEACTIVATED", "VOICE_CHAT_CHANNEL_DISPLAY_NAME_CHANGED",
+	"VOICE_CHAT_CHANNEL_JOINED", "VOICE_CHAT_CHANNEL_MEMBER_ACTIVE_STATE_CHANGED", "VOICE_CHAT_CHANNEL_MEMBER_ADDED",
+	"VOICE_CHAT_CHANNEL_MEMBER_ENERGY_CHANGED", "VOICE_CHAT_CHANNEL_MEMBER_GUID_UPDATED",
+	"VOICE_CHAT_CHANNEL_MEMBER_MUTE_FOR_ALL_CHANGED", "VOICE_CHAT_CHANNEL_MEMBER_MUTE_FOR_ME_CHANGED",
+	"VOICE_CHAT_CHANNEL_MEMBER_REMOVED", "VOICE_CHAT_CHANNEL_MEMBER_SILENCED_CHANGED",
+	"VOICE_CHAT_CHANNEL_MEMBER_SPEAKING_STATE_CHANGED", "VOICE_CHAT_CHANNEL_MEMBER_STT_MESSAGE",
+	"VOICE_CHAT_CHANNEL_MEMBER_VOLUME_CHANGED", "VOICE_CHAT_CHANNEL_MUTE_STATE_CHANGED", "VOICE_CHAT_CHANNEL_PTT_CHANGED",
+	"VOICE_CHAT_CHANNEL_REMOVED", "VOICE_CHAT_CHANNEL_TRANSCRIBING_CHANGED", "VOICE_CHAT_CHANNEL_TRANSMIT_CHANGED",
+	"VOICE_CHAT_CHANNEL_VOLUME_CHANGED", "VOICE_CHAT_COMMUNICATION_MODE_CHANGED", "VOICE_CHAT_CONNECTION_SUCCESS",
+	"VOICE_CHAT_DEAFENED_CHANGED", "VOICE_CHAT_ERROR", "VOICE_CHAT_INPUT_DEVICES_UPDATED", "VOICE_CHAT_LOGIN",
+	"VOICE_CHAT_LOGOUT", "VOICE_CHAT_MUTED_CHANGED", "VOICE_CHAT_OUTPUT_DEVICES_UPDATED",
+	"VOICE_CHAT_PENDING_CHANNEL_JOIN_STATE", "VOICE_CHAT_PTT_BUTTON_PRESSED_STATE_CHANGED", "VOICE_CHAT_SILENCED_CHANGED",
+	"VOICE_CHAT_SPEAK_FOR_ME_ACTIVE_STATUS_UPDATED", "VOICE_CHAT_SPEAK_FOR_ME_FEATURE_STATUS_UPDATED",
+	"VOICE_CHAT_TTS_PLAYBACK_BOOKMARK", "VOICE_CHAT_TTS_PLAYBACK_FAILED", "VOICE_CHAT_TTS_PLAYBACK_FINISHED",
+	"VOICE_CHAT_TTS_PLAYBACK_STARTED", "VOICE_CHAT_TTS_SPEAK_TEXT_UPDATE", "VOICE_CHAT_TTS_VOICES_UPDATE",
+	"VOICE_CHAT_VAD_SETTINGS_UPDATED",
+}
+-- Fire constantly while anyone talks: counted, not stored one by one.
+local NOISY_EVENTS = {
+	VOICE_CHAT_AUDIO_CAPTURE_ENERGY = true, VOICE_CHAT_CHANNEL_MEMBER_ENERGY_CHANGED = true,
+}
+
+local joinDiag      -- the run in progress: { rec, frame }
+local joinDiagFrame -- one hidden listener frame, reused by every run
+
+local function VoiceCall(name, ...)
+	local vc = C_VoiceChat
+	if type(vc) ~= "table" or type(vc[name]) ~= "function" then return { absent = true } end
+	local ok, ret = pcall(vc[name], ...)
+	if not ok then return { err = (Clean(ret)) } end
+	return diag.Typed(ret)
+end
+
+local function ShortEvent(e)
+	local label = e.event:gsub("^VOICE_CHAT_", "")
+	if e.event == "VOICE_CHAT_CHANNEL_JOINED" or e.event == "VOICE_CHAT_LOGIN" then
+		local a = e.args and e.args[1]
+		if a and a.v ~= nil then label = label .. "(" .. tostring(a.v) .. ")" end
+	elseif e.event == "VOICE_CHAT_ERROR" then
+		local a = e.args and e.args[2]
+		if a and a.v ~= nil then label = label .. "(" .. tostring(a.v) .. ")" end
+	end
+	return label
+end
+
+local function FinishJoinDiag()
+	local run = joinDiag
+	if not run then return end
+	joinDiag = nil
+	local rec = run.rec
+	pcall(run.frame.UnregisterAllEvents, run.frame)
+	run.frame:SetScript("OnEvent", nil)
+	local V = Hark.Voice
+	rec.final = {
+		t = diag.ClockNow(),
+		voiceState = V:GetState(), harkChannelID = diag.Typed(V:GetChannelID()), joined = V:IsActive(),
+		GetActiveChannelID = VoiceCall("GetActiveChannelID"),
+		IsLoggedIn = VoiceCall("IsLoggedIn"),
+	}
+	local okFacts, facts = pcall(V._JoinFacts)
+	rec.final.facts = okFacts and facts or { err = (Clean(facts)) }
+	-- Voice's own step log for this window.
+	rec.joinlog = {}
+	for _, e in ipairs(type(Hark.db.joinlog) == "table" and Hark.db.joinlog or {}) do
+		if type(e) == "table" and type(e.t) == "number" and e.t >= (rec.t0 or 0) - 0.01 then rec.joinlog[#rec.joinlog + 1] = e end
+	end
+	rec.complete = true
+	local order = {}
+	for i, e in ipairs(rec.events) do
+		if i > 12 then order[#order + 1] = "... (" .. #rec.events .. " in all)" break end
+		order[#order + 1] = ShortEvent(e)
+	end
+	local active = rec.final.GetActiveChannelID
+	local activeText = active.absent and "absent" or tostring(active.v == nil and "nil" or active.v)
+	local retry = rec.stringRetry and (" (string-id retry at " .. JOINDIAG_RETRY_AT .. " s: "
+		.. (#rec.events >= rec.stringRetry.eventIndex and "events followed" or "still no events") .. ")") or ""
+	Hark:Print(string.format("Join diagnostic: %s%s; events: %s; GetActiveChannelID %s. Type /reload to save it.",
+		rec.final.joined and "JOINED" or "NOT joined", retry,
+		#order == 0 and "none" or table.concat(order, ", "), activeText))
+end
+
+function Diagnostics:JoinDiag()
+	if not Hark.db then
+		Hark:Print("Not loaded yet.")
+		return
+	end
+	if joinDiag then
+		Hark:Print("Join diagnostic is already running.")
+		return
+	end
+	if not (C_Timer and C_Timer.NewTimer) then
+		Hark:Print("Join diagnostic needs C_Timer, which this client lacks.")
+		return
+	end
+	diag.InstallErrorHandler()
+	local okClock, t0 = pcall(GetTime)
+	local rec = { time = Now(), t = diag.ClockNow(), t0 = okClock and type(t0) == "number" and not Hark.IsSecret(t0) and t0 or 0,
+		version = Hark.version, seconds = JOINDIAG_SECONDS, complete = false,
+		accepted = {}, rejected = {}, events = {}, counts = {} }
+	Hark.db.joindiag = rec
+	local V = Hark.Voice
+	local okFacts, facts = pcall(V._JoinFacts)
+	rec.pre = okFacts and facts or { err = (Clean(facts)) }
+	if not okFacts then Hark._RecordError("joindiag facts", facts) end
+
+	joinDiagFrame = joinDiagFrame or CreateFrame("Frame")
+	local frame = joinDiagFrame
+	for _, event in ipairs(VOICE_EVENTS) do
+		if pcall(frame.RegisterEvent, frame, event) then
+			rec.accepted[#rec.accepted + 1] = event
+		else
+			rec.rejected[#rec.rejected + 1] = event
+		end
+	end
+	frame:SetScript("OnEvent", function(_, event, ...)
+		rec.counts[event] = (rec.counts[event] or 0) + 1
+		if NOISY_EVENTS[event] or #rec.events >= JOINDIAG_EVENTS_MAX then return end
+		local n = select("#", ...)
+		local args = { n = n }
+		local secret
+		for i = 1, n do
+			local v = (select(i, ...))
+			args[i] = diag.Typed(v)
+			if Hark.IsSecret(v) and not secret then secret = i end
+		end
+		local okNow, now = pcall(GetTime)
+		rec.events[#rec.events + 1] = { t = okNow and not Hark.IsSecret(now) and now or nil, event = event, args = args, secretArg = secret }
+	end)
+	joinDiag = { rec = rec, frame = frame }
+
+	local okJoin, r1, r2 = pcall(V.Join, V)
+	rec.join = { ok = okJoin, ret = diag.Typed(r1), message = diag.Typed(r2) }
+	if not okJoin then Hark._RecordError("joindiag Voice:Join", r1) end
+	if okJoin and r1 == false and type(r2) == "string" then Hark:Print(r2) end
+	Hark:Print("Join diagnostic running for " .. JOINDIAG_SECONDS .. " s (" .. #rec.accepted .. " voice events hooked)...")
+	-- The request returns nothing, so a client that silently ignores numeric ids
+	-- looks like "no event". Settle it in the same run: one retry with the
+	-- strings (the form a hand call proved), only when nothing at all came back.
+	C_Timer.NewTimer(JOINDIAG_RETRY_AT, function()
+		if joinDiag == nil or joinDiag.rec ~= rec or #rec.events > 0 or V:IsActive() then return end
+		local lastRequest
+		for _, e in ipairs(type(Hark.db.joinlog) == "table" and Hark.db.joinlog or {}) do
+			if type(e) == "table" and e.step == "request" and type(e.t) == "number" and e.t >= rec.t0 - 0.01 then lastRequest = e end
+		end
+		if not (lastRequest and lastRequest.form == "number" and lastRequest.ok) then return end
+		local clubId = Hark.db.communityId
+		local streamId = clubId and V:ResolveStreamId(clubId)
+		local fn = C_VoiceChat and C_VoiceChat.RequestJoinAndActivateCommunityStreamChannel
+		if not (clubId and streamId and type(fn) == "function") then return end
+		local okCall, err = pcall(fn, tostring(clubId), tostring(streamId))
+		if not okCall then Hark._RecordError("joindiag string retry", err) end
+		local okNow, now = pcall(GetTime)
+		rec.stringRetry = { t = okNow and not Hark.IsSecret(now) and now or nil, eventIndex = #rec.events + 1,
+			args = { diag.Typed(tostring(clubId)), diag.Typed(tostring(streamId)) }, ok = okCall, err = not okCall and (Clean(err)) or nil }
+	end)
+	C_Timer.NewTimer(JOINDIAG_SECONDS, FinishJoinDiag)
+end
+
+---------------------------------------------------------------------------
 -- /hark trace
 ---------------------------------------------------------------------------
 
@@ -446,6 +621,10 @@ end
 function Diagnostics:OnSlash(cmd, rest)
 	if cmd == "selftest" then
 		self:SelfTest()
+		return
+	end
+	if cmd == "joindiag" then
+		self:JoinDiag()
 		return
 	end
 	local arg = (rest or ""):lower()

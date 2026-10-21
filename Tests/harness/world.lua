@@ -137,7 +137,8 @@ function World:AddPlayer(spec)
 	c.units = {}
 	c.prefixes = {}
 	c.bucket = { tokens = self.options.throttleBurst, t = self.clock.now }
-	c.voice = { channels = {}, active = nil, nextChannelID = 1 + c.index * 7, volumes = {}, muted = {} }
+	c.voice = { channels = {}, active = nil, nextChannelID = 1 + c.index * 7, volumes = {}, muted = {},
+		loggedIn = spec.voiceLoggedIn ~= false }
 	c.chatChannels = {}
 	c.cvars, c.registeredCVars = {}, {}
 	for k, v in pairs(BUILTIN_CVARS) do c.cvars[k] = v end
@@ -258,7 +259,8 @@ end
 function World:ShowCreature(name, unit, npcID, creatureName)
 	local c = self:Get(name)
 	npcID = npcID or 299
-	local guid = string.format("Creature-0-5000-%d-%d-%d-%010X",
+	-- %.0f: the zone UID may exceed 2^31 in tests, and %d now raises there as in game.
+	local guid = string.format("Creature-0-5000-%.0f-%.0f-%.0f-%010X",
 		c.instanceID, self:LayerZoneUID(c.instanceID, c.layer), npcID, 0x1000 + npcID)
 	c.units[unit:lower()] = { creature = true, guid = guid, name = creatureName or "Young Wolf", npcID = npcID }
 	if unit == "target" then
@@ -316,7 +318,7 @@ function World:VoiceJoin(c, ch, activate)
 	local localID = c.voice.nextChannelID
 	c.voice.nextChannelID = c.voice.nextChannelID + 1
 	c.voice.channels[localID] = ch
-	c:FireEvent("VOICE_CHAT_CHANNEL_JOINED", 0, localID, ch.channelType, ch.clubId, ch.streamId)
+	c:FireEvent("VOICE_CHAT_CHANNEL_JOINED", 0, localID, ch.channelType, WowApi.IdNumber(ch.clubId), WowApi.IdNumber(ch.streamId))
 	for _, m in ipairs(ch.members) do
 		local o = m.client
 		if o ~= c then

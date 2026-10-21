@@ -51,6 +51,35 @@ string.trim = string.trim or strtrim
 string.split = string.split or strsplit
 string.join = string.join or strjoin
 
+-- The client's string.format stores a %d (or %i) argument in a signed 32-bit
+-- integer and raises for anything outside that range, where stock Lua 5.1 on
+-- a 64-bit host prints it happily. Measured live: a settings checksum above
+-- 2^31 broke the backup with exactly this message. Installed on the shared
+-- string table, so ("%d"):format(n) and the string.format the addon sees
+-- (api.string is this same table) both behave like the client.
+local INT32_MIN, INT32_MAX = -2147483648, 2147483647
+local hostFormat = rawget(string, "_hostFormat") or string.format
+local function strictFormat(fmt, ...)
+	if type(fmt) == "string" and fmt:find("%", 1, true) then
+		local argIndex = 0
+		for conv in fmt:gmatch("%%[^%a%%]*([%a%%])") do
+			if conv ~= "%" then
+				argIndex = argIndex + 1
+				if conv == "d" or conv == "i" then
+					local n = tonumber((select(argIndex, ...)))
+					if n and n == n and (n < INT32_MIN or n > INT32_MAX) then
+						error("integer overflow attempting to store " .. hostFormat("%.14g", n), 2)
+					end
+				end
+			end
+		end
+	end
+	return hostFormat(fmt, ...)
+end
+string._hostFormat = hostFormat
+string.format = strictFormat
+WowApi.StrictFormat = strictFormat
+
 -- Pure-Lua 32-bit bit library (WoW ships "bit" = LuaBitOp).
 local bitlib = rawget(_G, "bit")
 if not bitlib then
@@ -224,6 +253,13 @@ function WowApi.DispatchSlash(client, text)
 		end
 	end
 	return false
+end
+
+-- A club or stream id as the client hands it to addons: a number (Forever
+-- docs type ClubId/ClubStreamId as numbers). nil stays nil.
+function WowApi.IdNumber(id)
+	if id == nil then return nil end
+	return tonumber(id) or id
 end
 
 -- ---------------------------------------------------------------------------
@@ -524,9 +560,12 @@ function WowApi.Build(client)
 		SendAddonMessageResult = { Success = 0, InvalidPrefix = 1, InvalidMessage = 2, AddonMessageThrottle = 3, InvalidChatType = 4, NotInGroup = 5, TargetRequired = 6, InvalidChannel = 7, ChannelThrottle = 8, GeneralError = 9 },
 		RegisterAddonMessagePrefixResult = { Success = 0, DuplicatePrefix = 1, InvalidPrefix = 2, MaxPrefixes = 3 },
 		ChatChannelType = { None = 0, Custom = 1, PrivateParty = 2, PublicParty = 3, Communities = 4 },
-		VoiceChatStatusCode = { Success = 0, OperationPending = 1, TooManyRequests = 2, LoginProhibited = 3, ClientNotInitialized = 4, ClientNotLoggedIn = 5, ClientAlreadyLoggedIn = 6, ChannelNameTooShort = 7, ChannelNameTooLong = 8, ChannelAlreadyExists = 9, AlreadyInChannel = 10, TargetNotFound = 11, Failure = 12 },
+		-- Values from the Forever 1.60.1 API docs (VoiceChatDocumentation.lua).
+		VoiceChatStatusCode = { Success = 0, OperationPending = 1, TooManyRequests = 2, LoginProhibited = 3, ClientNotInitialized = 4, ClientNotLoggedIn = 5, ClientAlreadyLoggedIn = 6, ChannelNameTooShort = 7, ChannelNameTooLong = 8, ChannelAlreadyExists = 9, AlreadyInChannel = 10, TargetNotFound = 11, Failure = 12,
+			ServiceLost = 13, UnableToLaunchProxy = 14, ProxyConnectionTimeOut = 15, ProxyConnectionUnableToConnect = 16, ProxyConnectionUnexpectedDisconnect = 17, Disabled = 18, UnsupportedChatChannelType = 19, InvalidCommunityStream = 20, PlayerSilenced = 21, PlayerVoiceChatParentalDisabled = 22, InvalidInputDevice = 23, InvalidOutputDevice = 24, PlayerVoiceChatAgeVerificationRestricted = 25 },
 		ClubType = { BattleNet = 0, Character = 1, Guild = 2, Other = 3 },
-		ClubStreamType = { General = 0, Guild = 1, Officer = 2, Other = 3 },
+		-- Forever 1.60.1 ClubDocumentation.lua: Discord = 3, Other = 4.
+		ClubStreamType = { General = 0, Guild = 1, Officer = 2, Discord = 3, Other = 4 },
 		UIMapType = { Cosmic = 0, World = 1, Continent = 2, Zone = 3, Dungeon = 4, Micro = 5, Orphan = 6 },
 	}
 	local R = api.Enum.SendAddonMessageResult
@@ -611,24 +650,30 @@ function WowApi.Build(client)
 	end
 
 	-- Communities --------------------------------------------------------------
+	-- ClubId and ClubStreamId are numbers in the Forever API docs, so every
+	-- id the mock hands to the addon is a number (the world keys them as strings).
+	local idNum = WowApi.IdNumber
 	local function memberOf(club) return club.members[client.name] == true end
 	api.C_Club = {
 		GetSubscribedClubs = function()
 			local out = {}
 			for _, club in pairs(world.communities) do
-				if memberOf(club) then out[#out + 1] = { clubId = club.clubId, name = club.name, clubType = 1, memberCount = 0 } end
+				if memberOf(club) then out[#out + 1] = { clubId = idNum(club.clubId), name = club.name, clubType = 1, memberCount = 0 } end
 			end
 			return out
 		end,
 		GetClubInfo = function(clubId)
 			local club = world.communities[tostring(clubId)]
-			if club and memberOf(club) then return { clubId = club.clubId, name = club.name, clubType = 1 } end
+			if club and memberOf(club) then return { clubId = idNum(club.clubId), name = club.name, clubType = 1 } end
 		end,
 		GetStreams = function(clubId)
 			local club = world.communities[tostring(clubId)]
 			local out = {}
 			if club and memberOf(club) then
-				for _, s in pairs(club.streams) do out[#out + 1] = { streamId = s.streamId, name = s.name, streamType = 0 } end
+				for _, s in pairs(club.streams) do
+					out[#out + 1] = { streamId = idNum(s.streamId), name = s.name, subject = "", leadersAndModeratorsOnly = false,
+						streamType = s.streamType or 0, creationTime = 1700000000 }
+				end
 			end
 			return out
 		end,
@@ -650,9 +695,9 @@ function WowApi.Build(client)
 		end
 		return {
 			name = ch.name or "Proximity", channelID = localID, channelType = ch.channelType or 4,
-			clubId = ch.clubId, streamId = ch.streamId, volume = 1,
+			clubId = idNum(ch.clubId), streamId = idNum(ch.streamId), volume = 1,
 			isActive = client.voice.active == localID, isMuted = false, isTransmitting = false,
-			isLocalProcess = false, members = members,
+			isTranscribing = false, members = members,
 		}
 	end
 	local function memberGUID(memberID, localID)
@@ -672,7 +717,24 @@ function WowApi.Build(client)
 	end
 	client.voiceInvalid = {}
 	api.C_VoiceChat = {
-		IsLoggedIn = function() return true end,
+		-- Logged in unless the player was created with voiceLoggedIn = false.
+		-- Login answers OperationPending and VOICE_CHAT_LOGIN(Success) follows,
+		-- as Blizzard's ChannelFrame expects. MOCK: a community join requested
+		-- while logged out is silently dropped (the case Hark now guards against).
+		IsLoggedIn = function() return client.voice.loggedIn == true end,
+		Login = function()
+			local codes = api.Enum.VoiceChatStatusCode
+			if client.voice.loggedIn then return codes.ClientAlreadyLoggedIn end
+			if client.voice.loginPending then return codes.OperationPending end
+			client.voice.loginPending = true
+			clock:Schedule(world.options.voiceLoginDelay or 1, function()
+				client.voice.loginPending = false
+				if not client.online then return end
+				client.voice.loggedIn = true
+				client:FireEvent("VOICE_CHAT_LOGIN", codes.Success)
+			end, function(fn) fn() end)
+			return codes.OperationPending
+		end,
 		CanPlayerUseVoiceChat = function() return true end,
 		IsVoiceChatConnected = function() return true end,
 		GetActiveChannelID = function() return client.voice.active end,
@@ -739,12 +801,13 @@ function WowApi.Build(client)
 		-- VOICE_CHAT_CHANNEL_JOINED(statusCode, channelID, channelType, clubId, streamId).
 		RequestJoinAndActivateCommunityStreamChannel = function(clubId, streamId)
 			clubId, streamId = tostring(clubId), tostring(streamId)
+			if not client.voice.loggedIn then return end
 			clock:Schedule(world.options.voiceJoinDelay, function()
 				if not client.online then return end
 				local club = world.communities[clubId]
 				local stream = club and club.streams[streamId]
 				if not (club and stream and stream.voice and memberOf(club)) then
-					client:FireEvent("VOICE_CHAT_CHANNEL_JOINED", api.Enum.VoiceChatStatusCode.TargetNotFound, nil, 4, clubId, streamId)
+					client:FireEvent("VOICE_CHAT_CHANNEL_JOINED", api.Enum.VoiceChatStatusCode.TargetNotFound, 0, 4, idNum(clubId), idNum(streamId))
 					return
 				end
 				local ch = world:VoiceChannel(world:VoiceKey(clubId, streamId), { clubId = clubId, streamId = streamId, channelType = 4, name = club.name })

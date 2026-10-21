@@ -396,4 +396,264 @@ else
 	end
 end
 
+---------------------------------------------------------------------------
+-- Voice join: HarkDB.joinlog and HarkDB.joindiag (CONTRACT.md 13)
+---------------------------------------------------------------------------
+
+-- A typed value { t = luaType, v = value } as `value:type`; "<secret>" for secrets.
+local function tv(x, depth)
+	depth = depth or 0
+	if type(x) ~= "table" then return show(x) end
+	if x.absent then return "ABSENT" end
+	if x.err ~= nil and x.t == nil then return "ERROR " .. tv(x.err, depth + 1) end
+	local t = x.t
+	if t == nil then
+		-- a plain table (attempt record, list): render its fields
+		if depth >= 4 then return "{...}" end
+		local keys = {}
+		for k in pairs(x) do keys[#keys + 1] = k end
+		table.sort(keys, function(a, b)
+			if type(a) == type(b) and (type(a) == "number" or type(a) == "string") then return a < b end
+			return type(a) < type(b)
+		end)
+		local parts = {}
+		for _, k in ipairs(keys) do
+			if k ~= "n" then
+				parts[#parts + 1] = (type(k) == "number" and ("[" .. k .. "]") or tostring(k)) .. "=" .. tv(x[k], depth + 1)
+			end
+		end
+		return "{" .. table.concat(parts, ", ") .. "}"
+	end
+	if t == "nil" then return "nil" end
+	if t == "secret" then return "<secret>" end
+	if t == "string" then return string.format("%q", tostring(x.v)) .. ":string" end
+	if t == "table" then
+		if type(x.v) ~= "table" then return tostring(x.v) end
+		return tv(x.v, depth + 1)
+	end
+	return tostring(x.v) .. ":" .. t
+end
+
+local function plainOf(x) -- the value of a typed record, or nil
+	if type(x) == "table" and x.t ~= nil and x.t ~= "secret" and x.t ~= "nil" then return x.v end
+	return nil
+end
+
+local STATUS = { [0] = "Success", "OperationPending", "TooManyRequests", "LoginProhibited", "ClientNotInitialized",
+	"ClientNotLoggedIn", "ClientAlreadyLoggedIn", "ChannelNameTooShort", "ChannelNameTooLong", "ChannelAlreadyExists",
+	"AlreadyInChannel", "TargetNotFound", "Failure", "ServiceLost", "UnableToLaunchProxy", "ProxyConnectionTimeOut",
+	"ProxyConnectionUnableToConnect", "ProxyConnectionUnexpectedDisconnect", "Disabled", "UnsupportedChatChannelType",
+	"InvalidCommunityStream", "PlayerSilenced", "PlayerVoiceChatParentalDisabled", "InvalidInputDevice",
+	"InvalidOutputDevice", "PlayerVoiceChatAgeVerificationRestricted" }
+local function statusName(code) return tostring(code) .. (STATUS[code] and (" " .. STATUS[code]) or "") end
+
+-- The streams GetStreams returned in a resolveStream/getStreams attempt list.
+local function streamsFrom(attempts)
+	if type(attempts) ~= "table" then return nil end
+	for _, a in ipairs(attempts) do
+		if type(a) == "table" and type(a.ret) == "table" and a.ret.t == "table" and type(a.ret.v) == "table" then
+			local list = {}
+			for _, s in pairs(a.ret.v) do
+				if type(s) == "table" and type(s.v) == "table" then list[#list + 1] = s.v end
+			end
+			return list, a.form
+		end
+	end
+	return nil
+end
+
+local function printJoinEntries(entries)
+	for _, e in ipairs(entries) do
+		local parts = {}
+		local keys = {}
+		for k in pairs(e) do if k ~= "t" and k ~= "step" then keys[#keys + 1] = k end end
+		table.sort(keys)
+		for _, k in ipairs(keys) do parts[#parts + 1] = k .. "=" .. tv(e[k]) end
+		P(string.format("    %9s  %-16s %s", tostring(e.t), tostring(e.step), table.concat(parts, "  ")))
+		if e.step == "resolveStream" then
+			local list = streamsFrom(e.getStreams)
+			if list then
+				for _, s in ipairs(list) do
+					local voice = {}
+					for k, v in pairs(s) do
+						if tostring(k):lower():find("voice") then voice[#voice + 1] = k .. "=" .. tv(v) end
+					end
+					P(string.format("               stream %s  type %s  name %s%s", tv(s.streamId), tv(s.streamType), tv(s.name),
+						#voice > 0 and ("  " .. table.concat(voice, " ")) or "  (no voice field)"))
+				end
+			end
+		end
+	end
+end
+
+--- Which step of the latest join failed, from the log entries.
+local function joinVerdict(entries)
+	local start
+	for i = #(entries or {}), 1, -1 do
+		local e = entries[i]
+		if type(e) == "table" and e.step == "join" and e.clubId ~= nil and e.outcome == nil then start = i break end
+	end
+	if not start then
+		for i = #(entries or {}), 1, -1 do
+			local e = entries[i]
+			if type(e) == "table" and e.step == "join" and e.outcome then return "Join returned early: " .. tostring(e.outcome) .. "." end
+		end
+		return "No join attempt recorded (type /hark join or /hark joindiag, then /reload)."
+	end
+	local s = { events = {}, notes = {} }
+	for i = start, #entries do
+		local e = entries[i]
+		if e.step == "join" then s.clubId, s.streamId = plainOf(e.clubId), plainOf(e.streamId)
+		elseif e.step == "resolveStream" then s.source, s.streams = e.source, streamsFrom(e.getStreams)
+			s.getStreamsTried = e.getStreams
+		elseif e.step == "isLoggedIn" then s.loggedIn = plainOf(e.ret)
+		elseif e.step == "login" then s.login = e.status
+		elseif e.step == "loginFailed" then s.loginFailed = e.status
+		elseif e.step == "lookup" then s.lookup = e
+		elseif e.step == "request" then s.request = e
+		elseif e.step == "activate" then s.activate = e
+		elseif e.step == "event" then s.events[#s.events + 1] = e
+		elseif e.step == "joinedDecision" then s.joined = e.decision
+		elseif e.step == "activatedDecision" then s.activated = e.decision
+		elseif e.step == "timeout" then s.timeout = e
+		elseif e.step == "adopt" then s.adopt = e
+		end
+	end
+	local streamNote = ""
+	if s.streams then
+		local found = false
+		for _, st in ipairs(s.streams) do
+			if tostring(plainOf(st.streamId)) == tostring(s.streamId) then found = true end
+		end
+		if #s.streams == 0 then
+			streamNote = " GetStreams returned an empty list for this club."
+		elseif not found then
+			streamNote = " Stream " .. tostring(s.streamId) .. " is NOT in this club's GetStreams list."
+		end
+	elseif s.getStreamsTried then
+		streamNote = " GetStreams returned nothing for this club (in either id form)."
+	end
+	if s.adopt then
+		return "JOINED: adopted channel " .. tv(s.adopt.channelID)
+			.. (s.timeout and (" (at the timeout: " .. tostring(s.timeout.decision) .. ")") or "") .. "."
+	end
+	for _, e in ipairs(s.events) do
+		if e.dropped then
+			return "FAILED AT the event guard: " .. tostring(e.event) .. " was dropped because argument "
+				.. tostring(e.secretArg) .. " is a secret value."
+		end
+	end
+	if s.loginFailed then return "FAILED AT voice login: VOICE_CHAT_LOGIN reported status " .. tostring(s.loginFailed) .. "." end
+	for _, e in ipairs(s.events) do
+		if e.event == "VOICE_CHAT_CHANNEL_JOINED" and type(e.args) == "table" then
+			local status = plainOf(e.args[1])
+			if status ~= nil and status ~= 0 then
+				return "FAILED AT the join request: the client answered VOICE_CHAT_CHANNEL_JOINED with status "
+					.. statusName(status) .. " for club " .. tv(e.args[4]) .. " stream " .. tv(e.args[5]) .. "." .. streamNote
+			end
+		end
+	end
+	if s.joined and s.joined:find("^ignored") then
+		return "FAILED AT event matching: the JOINED event was " .. s.joined .. "." .. streamNote
+	end
+	if s.joined and s.joined:find("waiting for activation") then
+		if s.activated then return "FAILED AT activation matching: ACTIVATED was " .. s.activated .. "." end
+		return "FAILED AT activation: " .. s.joined .. ", but VOICE_CHAT_CHANNEL_ACTIVATED never came."
+	end
+	local sawLogin = false
+	for _, e in ipairs(s.events) do if e.event == "VOICE_CHAT_LOGIN" then sawLogin = true end end
+	if s.loggedIn == false and not sawLogin then
+		return "FAILED AT voice login: voice chat was not logged in (Login said " .. tostring(s.login)
+			.. ") and VOICE_CHAT_LOGIN never arrived."
+	end
+	if s.request and s.request.absent then return "FAILED: RequestJoinAndActivateCommunityStreamChannel is absent on this client." end
+	if s.request and s.request.ok == false then
+		return "FAILED AT the request call: it raised " .. tv(s.request.err) .. " (form " .. tostring(s.request.form) .. ")."
+	end
+	if #s.events == 0 and (s.request or s.activate) then
+		local what = s.request and ("RequestJoinAndActivateCommunityStreamChannel(" .. tv(s.request.args and s.request.args[1])
+			.. ", " .. tv(s.request.args and s.request.args[2]) .. ")") or ("ActivateChannel(" .. tv(s.activate.args and s.activate.args[1]) .. ")")
+		return "FAILED AT the request: " .. what .. " produced no voice event at all. Stream "
+			.. tostring(s.streamId) .. " came from " .. tostring(s.source) .. "." .. streamNote
+	end
+	if s.timeout then
+		return "UNDETERMINED: timed out with " .. #s.events .. " voice event(s); timeout lookup: "
+			.. tostring(s.timeout.decision) .. ", active channel " .. tv(s.timeout.activeChannelID) .. "." .. streamNote
+	end
+	return "IN PROGRESS or no outcome recorded (the /reload came before the 10 s timeout?)." .. streamNote
+end
+
+H("Voice join log")
+local joinlog = type(db.joinlog) == "table" and db.joinlog or {}
+if #joinlog == 0 then
+	P("No join log (Hark records one on every /hark join; then /reload).")
+else
+	P(#joinlog, " entries (newest 40 kept)")
+	printJoinEntries(joinlog)
+	P("Verdict (latest join): ", joinVerdict(joinlog))
+end
+
+H("Join diagnostic (/hark joindiag)")
+local jd = db.joindiag
+if type(jd) ~= "table" then
+	P("Never run. In game: /hark joindiag, wait for 'Join diagnostic:', then /reload.")
+else
+	P("Run at ", when(jd.time), " (GetTime ", tostring(jd.t), "), Hark ", tostring(jd.version), ", window ", tostring(jd.seconds), " s",
+		jd.complete and "" or "   NOT COMPLETE: the /reload came before the window ended")
+	if type(jd.pre) == "table" then
+		P("Before the join:")
+		local keys = {}
+		for k in pairs(jd.pre) do keys[#keys + 1] = k end
+		table.sort(keys)
+		for _, k in ipairs(keys) do P("    ", k, " = ", tv(jd.pre[k])) end
+		local list = streamsFrom(jd.pre.getStreams)
+		if list then
+			for _, s in ipairs(list) do
+				P(string.format("    stream %s  type %s  name %s", tv(s.streamId), tv(s.streamType), tv(s.name)))
+			end
+		end
+	end
+	P("Voice:Join() returned ", tv(jd.join))
+	P("Events hooked: ", #(jd.accepted or {}), "; refused by the client (", #(jd.rejected or {}), "): ",
+		#(jd.rejected or {}) > 0 and table.concat(jd.rejected, ", ") or "none")
+	local counts = {}
+	for event, n in pairs(jd.counts or {}) do counts[#counts + 1] = event:gsub("^VOICE_CHAT_", "") .. " x" .. n end
+	table.sort(counts)
+	P("Event counts: ", #counts > 0 and table.concat(counts, ", ") or "none")
+	P("Events in order:")
+	if #(jd.events or {}) == 0 then P("    none") end
+	for _, e in ipairs(jd.events or {}) do
+		local args = {}
+		for i = 1, tonumber(e.args and e.args.n) or 0 do args[i] = tv(e.args[i]) end
+		P(string.format("    %9s  %s(%s)%s", tostring(e.t), tostring(e.event), table.concat(args, ", "),
+			e.secretArg and ("  [arg " .. e.secretArg .. " secret]") or ""))
+	end
+	if type(jd.final) == "table" then
+		P("At the end: joined ", tostring(jd.final.joined), ", Hark state ", tostring(jd.final.voiceState),
+			", GetActiveChannelID ", tv(jd.final.GetActiveChannelID), ", IsLoggedIn ", tv(jd.final.IsLoggedIn))
+		if type(jd.final.facts) == "table" then P("    lookup now: ", tv(jd.final.facts.lookup)) end
+	end
+	local retry = jd.stringRetry
+	if type(retry) == "table" then
+		local after = {}
+		for i = tonumber(retry.eventIndex) or 1, #(jd.events or {}) do after[#after + 1] = tostring(jd.events[i].event):gsub("^VOICE_CHAT_", "") end
+		P("String-id retry at GetTime ", tostring(retry.t), ": RequestJoinAndActivateCommunityStreamChannel(",
+			tv(retry.args and retry.args[1]), ", ", tv(retry.args and retry.args[2]), ") ", retry.ok and "called" or ("raised " .. tostring(retry.err)),
+			"; events after it: ", #after > 0 and table.concat(after, ", ") or "none")
+	end
+	if type(jd.joinlog) == "table" and #jd.joinlog > 0 then
+		P("Join steps in the window:")
+		printJoinEntries(jd.joinlog)
+		local verdict = joinVerdict(jd.joinlog)
+		if type(retry) == "table" and #(jd.events or {}) >= (tonumber(retry.eventIndex) or 1) then
+			verdict = "ID FORM: the numeric-id request drew no event, the string-id retry did"
+				.. (jd.final and jd.final.joined and " and joined" or "") .. ". The client ignores numeric ids for this call. ("
+				.. verdict .. ")"
+		elseif type(retry) == "table" then
+			verdict = verdict .. " The string-id retry drew no event either, so the id form is not the cause."
+		end
+		P("Verdict: ", verdict)
+	end
+end
+
 print(table.concat(out, "\n"))

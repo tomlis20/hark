@@ -187,6 +187,7 @@ because community voice is world-wide and has nothing to leave per zone.
   `VOICE_CHAT_CHANNEL_REMOVED`, `VOICE_CHAT_CHANNEL_MEMBER_ADDED`, `VOICE_CHAT_CHANNEL_MEMBER_REMOVED`,
   `VOICE_CHAT_CHANNEL_MEMBER_GUID_UPDATED`, `VOICE_CHAT_CHANNEL_MEMBER_ACTIVE_STATE_CHANGED`,
   `VOICE_CHAT_CHANNEL_MEMBER_SPEAKING_STATE_CHANGED`, `VOICE_CHAT_LOGOUT`, `VOICE_CHAT_ERROR`,
+  `VOICE_CHAT_LOGIN`, `VOICE_CHAT_PENDING_CHANNEL_JOIN_STATE`, `VOICE_CHAT_CONNECTION_SUCCESS` (section 13),
   `PLAYER_STARTED_MOVING`, `PLAYER_STOPPED_MOVING`, `ZONE_CHANGED_NEW_AREA`.
 
 UI and Options may register their own game events on their own frames.
@@ -346,3 +347,88 @@ public API and may change.
 `Tests/readselftest.lua` reads a saved `Hark.lua` outside the game and prints the facts, a verdict
 per open question, the error buffer and the trace as a per-member timeline.
 `Tests/pull-selftest.sh` finds the newest such file across every install and runs the reader on it.
+
+## 13. Voice join observability (21 Oct 2026)
+
+Live failure: `/hark join` timed out every time on the Forever client while a hand call of
+`C_VoiceChat.RequestJoinAndActivateCommunityStreamChannel("23111161", "1")` joined. Hark recorded
+nothing about which step failed. This section records what the API documentation says, what Hark now
+assumes, and the new evidence it keeps.
+
+### 13.1 Sources
+
+warcraft.wiki.gg returned HTTP 502 for most voice pages on 21 Oct 2026. These pages loaded, and each
+version table lists `forever 1.60.1`: `VOICE_CHAT_CHANNEL_DEACTIVATED`, `VOICE_CHAT_LOGIN` (which
+carries the full `Enum.VoiceChatStatusCode` table) and `API C_Club.GetStreams`. Everything else comes
+from the wiki's own "Blizzard Docs" source for the Forever client: `Ketho/wow-ui-source-forever`, branch
+`forever`, build 1.60.1 (70009), files `Blizzard_APIDocumentationGenerated/VoiceChatDocumentation.lua`
+and `ClubDocumentation.lua`. The wiki generates its API pages from those same files. Blizzard's own
+join code (`Blizzard_Channels/Classic/ChannelFrame.lua`, `Blizzard_ChatFrame/Mainline/VoiceChatHeadsetButton.lua`)
+was read for behaviour.
+
+### 13.2 What the documentation says
+
+| Item | Forever 1.60.1 |
+|---|---|
+| `VOICE_CHAT_CHANNEL_JOINED` | `status` (VoiceChatStatusCode), `channelID` (number), `channelType` (ChatChannelType), `clubId` (ClubId, **nilable**), `streamId` (ClubStreamId, **nilable**). SynchronousEvent; no secret predicates. Matches Hark's order. |
+| `VOICE_CHAT_CHANNEL_ACTIVATED`, `_DEACTIVATED`, `_REMOVED` | `channelID` (number) |
+| `VOICE_CHAT_ERROR` | `platformCode` (number), `statusCode` (VoiceChatStatusCode) |
+| `VOICE_CHAT_LOGIN` | `status` (VoiceChatStatusCode) |
+| `VOICE_CHAT_PENDING_CHANNEL_JOIN_STATE` | `channelType`, `clubId` (nilable), `streamId` (nilable), `pendingJoin` (bool) |
+| `C_VoiceChat.GetChannelForCommunityStream(clubId, streamId)` | args ClubId, ClubStreamId. `MayReturnNothing`, `SecretInChatMessagingLockdown`, `SecretArguments = AllowedWhenUntainted`. Returns `VoiceChatChannel`. |
+| `C_VoiceChat.GetChannel(channelID)` | same predicates; returns `VoiceChatChannel` |
+| `VoiceChatChannel` | `name` string; `channelID` number; `channelType`; `clubId` ClubId; `streamId` ClubStreamId; `volume` number; `isActive`, `isMuted`, `isTransmitting`, `isTranscribing` bool; `members` VoiceChatMember[]. Every field except `name` and `members` is `NeverSecret`. There is **no** `isLocalProcess`. |
+| `VoiceChatMember` | `energy`, `memberID` number; `isActive`, `isSpeaking`, `isMutedForAll`, `isSilenced` bool. No `name`. |
+| `C_VoiceChat.RequestJoinAndActivateCommunityStreamChannel(clubId, streamId)` | ClubId, ClubStreamId; returns nothing |
+| `C_VoiceChat.Login()` | returns `status` (VoiceChatStatusCode). `IsLoggedIn()` returns bool. `GetActiveChannelID()` returns number, nilable. |
+| `C_Club.GetStreams(clubId)` | `SecretInChatMessagingLockdown`, `RequiresClubsInitialized`, `AllowedWhenUntainted`. Entries `ClubStreamInfo`: `streamId` ClubStreamId, `name` string, `subject` string, `leadersAndModeratorsOnly` bool, `streamType` (`NeverSecret`), `creationTime` BigUInteger. **No field says whether a stream has voice.** |
+| ClubId, ClubStreamId | the wiki types both as **number** |
+| `Enum.ClubStreamType` | General 0, Guild 1, Officer 2, Discord 3, Other 4 |
+| `Enum.VoiceChatStatusCode` | Success 0, OperationPending 1, TooManyRequests 2, LoginProhibited 3, ClientNotInitialized 4, ClientNotLoggedIn 5, ClientAlreadyLoggedIn 6, ChannelNameTooShort 7, ChannelNameTooLong 8, ChannelAlreadyExists 9, AlreadyInChannel 10, TargetNotFound 11, Failure 12, ServiceLost 13, UnableToLaunchProxy 14, ProxyConnectionTimeOut 15, ProxyConnectionUnableToConnect 16, ProxyConnectionUnexpectedDisconnect 17, Disabled 18, UnsupportedChatChannelType 19, InvalidCommunityStream 20, PlayerSilenced 21, PlayerVoiceChatParentalDisabled 22, InvalidInputDevice 23, InvalidOutputDevice 24, PlayerVoiceChatAgeVerificationRestricted 25 |
+
+Blizzard's UI behaviour:
+- `ChannelFrame:TryExecuteCommand` sends a voice request only when `IsLoggedIn()` is true. Otherwise it calls `Login()` and, on `OperationPending`, holds the request until `VOICE_CHAT_LOGIN` reports Success.
+- The headset button treats a channel as active when `GetActiveChannelID() == channel.channelID`, not when `channel.isActive` is true.
+
+### 13.3 Corrections to Hark's assumptions
+
+1. **Login.** Hark used to call `Login()` and then send the request immediately. It now holds the request until `VOICE_CHAT_LOGIN` arrives, or for 5 s at most, as Blizzard does. A failed login status ends the join with a message.
+2. **Active.** A channel counts as active when `isActive` is true **or** `GetActiveChannelID()` equals its id. This rule now applies to the join's lookup, the JOINED handler and the timeout.
+3. **Activation.** After a successful JOINED for our pending request, Hark remembers that channel id. `VOICE_CHAT_CHANNEL_ACTIVATED` for that id is adopted directly, without re-reading clubId and streamId through `GetChannel`.
+4. **Id forms.** Hark now passes ClubId and ClubStreamId to `C_VoiceChat` and `C_Club` as numbers when the saved string converts exactly. A lookup that returns nothing is retried with the strings. A request that raises is retried with the strings. `RequestJoinAndActivateCommunityStreamChannel` returns nothing, so a silent refusal cannot be detected. `Hark.db.communityId` and `streamId` stay strings.
+5. **Status text.** Failures now print the status code with its name, e.g. `11 TargetNotFound`.
+6. **Test mock.** The mock now hands out ids as numbers and uses `isTranscribing` instead of `isLocalProcess`. It has the full status and stream-type enums, and models Login/`VOICE_CHAT_LOGIN`.
+
+Unchanged and still unproven: the secret-value guard in `Voice` OnEvent still drops any event that has a secret argument. It now logs the drop and the argument index. Stream choice is also unchanged: saved `streamId`, else the lowest General stream, else `"1"`.
+
+### 13.4 New internal HarkDB keys
+
+Internal, like section 12.2. Voice owns `joinlog` and Diagnostics owns `joindiag`. Core only resets either one when it is not a table.
+
+| Key | Contents |
+|---|---|
+| `joinlog` | Up to 40 entries, newest kept, recorded **whether or not the trace is on**. Each entry is `{ t = GetTime(), step = name, ... }`. Steps: `join` (club, stream, saved stream, or an early `outcome`), `resolveStream` (result, source, every GetStreams attempt with the full list), `isLoggedIn`, `login`, `loginWait`, `loginFailed`, `lookup` / `timeout` (GetChannelForCommunityStream attempts per id form, channel id, active channel id, timeout decision), `request` / `activate` (call, form, typed args, ok or err), `event` (every channel-level `VOICE_CHAT_*` event, and member-level ones while a join is watched, with all args; `dropped` and `secretArg` when the secret guard discarded it), `joinedDecision`, `activatedDecision`, `adopt`. Values are typed records `{ t = luaType, v = value }`, and a secret is `{ t = "secret", v = "<secret>" }` (never raw). While `/hark trace` is on, each entry is also a trace row with `k = "join"`. |
+| `joindiag` | One `/hark joindiag` run: `pre` (Voice._JoinFacts: IsEnabled, CanPlayerUseVoiceChat, IsLoggedIn, IsVoiceChatConnected, GetCurrentVoiceChatConnectionStatusCode, GetActiveChannelID/Type, active channel, GetStreams, resolved stream, lookup in both forms, GetJoinClubVoiceChannelError, IsChannelJoinPending, GetClubInfo, subscribed), `accepted` / `rejected` (which of the 47 documented `VOICE_CHAT_*` events the client let it register), `events` (each with typed args, at most 200, energy events only counted), `counts`, `join` (what Voice:Join returned), `final` (joined, Hark state, GetActiveChannelID, IsLoggedIn, facts again), `joinlog` (the joinlog entries from the window), `stringRetry` (see 13.5; absent when not needed), `complete`. |
+
+### 13.5 Commands and output
+
+- `/hark joindiag` records the pre-join facts and hooks every `VOICE_CHAT_*` event the client accepts for 20 s on its own unnamed frame. It calls `Voice:Join()`, and at the end prints one line: joined or not, the events in order, and the final `GetActiveChannelID`. `/reload` saves it.
+  If the numeric-id request has drawn no voice event at all after 6 s, it sends one retry with the string ids (the form a hand call proved works) and records it as `stringRetry`. This settles the id-form question in the same run. It is the only request Diagnostics sends itself.
+- The join timeout now prints at most three lines, built from what was observed:
+  1. the club, the stream and where it came from, and the form the request used;
+  2. whether voice was logged in, and how many voice events arrived in the 10 s and which;
+  3. what the channel lookup returned, and the active channel.
+- `Tests/readselftest.lua` prints the join log and the join diagnostic. It ends each with a verdict naming the failing step where one can be inferred: the event guard, voice login, a JOINED failure status (with a note when the stream is missing from GetStreams), event matching, activation, or a request that produced no event at all.
+
+### 13.6 Internal hooks
+
+`Hark._diag.Typed` and `Voice._JoinFacts` exist for diagnostics and tests only, as in section 12.5.
+
+### 13.7 Number formatting
+
+This client's `string.format` raises "integer overflow attempting to store <n>" for a `%d` (or `%i`)
+argument outside the signed 32-bit range. Any value that can exceed it is formatted with `%.0f`: the
+settings checksum and stamp in Core, and the layer (creature-GUID zone UID) in the Positions wire
+message. Remaining `%d` uses are bounded: counts, schema values, yards, and `seq`, which wraps at
+999999. The test harness enforces the same limit on the shared string table.
+

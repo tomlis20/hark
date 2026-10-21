@@ -129,6 +129,8 @@ local function LoadDB()
 	if type(db.errors) ~= "table" then db.errors = {} end
 	if db.trace ~= nil and type(db.trace) ~= "table" then db.trace = nil end
 	if db.selftest ~= nil and type(db.selftest) ~= "table" then db.selftest = nil end
+	if db.joinlog ~= nil and type(db.joinlog) ~= "table" then db.joinlog = nil end
+	if db.joindiag ~= nil and type(db.joindiag) ~= "table" then db.joindiag = nil end
 	db.dbVersion = Hark.DB_VERSION
 	Hark.db = db
 	if Hark._diag then Hark._diag.FlushPendingErrors() end
@@ -293,7 +295,8 @@ end
 -- Payload: HK1:<stamp>:<length>:<checksum>:<body>. Anything after <length>
 -- characters of body is ignored (stale CVar chunks from a longer save).
 local function Pack(body)
-	return string.format("HK1:%d:%d:%d:", Now(), #body, Checksum(body)) .. body
+	-- %.0f, not %d: the checksum can exceed 2^31 and this client's %d refuses that.
+	return string.format("HK1:%.0f:%d:%.0f:", Now(), #body, Checksum(body)) .. body
 end
 
 --- Returns the decoded table and its timestamp, or nil for anything corrupt.
@@ -861,6 +864,44 @@ function diag.InstallErrorHandler()
 	return false
 end
 
+--- Plain, typed copy of a client value for the join log and /hark joindiag:
+-- { t = luaType, v = value }. A secret value becomes { t = "secret",
+-- v = "<secret>" } and is never stored raw. nil is { t = "nil" }. Tables are
+-- copied field by field to `maxDepth` levels (default 3), at most 24 fields each.
+local TYPED_FIELDS = 24
+function diag.Typed(v, maxDepth, depth)
+	if v == nil then return { t = "nil" } end
+	if Hark.IsSecret(v) then return { t = "secret", v = "<secret>" } end
+	local kind = type(v)
+	if kind == "number" then
+		if v ~= v then return { t = kind, v = "nan" } end
+		if v == math.huge or v == -math.huge then return { t = kind, v = v > 0 and "inf" or "-inf" } end
+		return { t = kind, v = v }
+	elseif kind == "string" then
+		if #v > 120 then v = v:sub(1, 120) .. "..." end
+		return { t = kind, v = v }
+	elseif kind == "boolean" then
+		return { t = kind, v = v }
+	elseif kind == "table" then
+		depth = depth or 0
+		if depth >= (maxDepth or 3) then return { t = kind, v = "<table>" } end
+		local out, count = {}, 0
+		for k, val in pairs(v) do
+			count = count + 1
+			if count > TYPED_FIELDS then out["(truncated)"] = { t = "note", v = "more fields not kept" } break end
+			local key = k
+			if Hark.IsSecret(k) then
+				key = "<secret>" .. count
+			elseif type(k) ~= "string" and not (type(k) == "number" and k == k and k ~= math.huge and k ~= -math.huge) then
+				key = "<" .. type(k) .. ">" .. count
+			end
+			out[key] = diag.Typed(val, maxDepth, depth + 1)
+		end
+		return { t = kind, v = out }
+	end
+	return { t = kind, v = "<" .. kind .. ">" }
+end
+
 --- "Player-4184-0A1B2C3D" -> "0A1B2C3D" (nil stays nil).
 function diag.ShortGUID(guid)
 	if type(guid) ~= "string" or Hark.IsSecret(guid) then return nil end
@@ -920,6 +961,7 @@ local function PrintHelp()
 	Hark:Print("  /hark options                  Open settings")
 	Hark:Print("  /hark selftest                 Probe the client and save the results (then /reload)")
 	Hark:Print("  /hark trace on | off | clear   Record volumes and messages to the saved variables")
+	Hark:Print("  /hark joindiag                 Record a voice join attempt for 20 s (then /reload)")
 end
 
 local function OnSlashCommand(msg)
@@ -994,7 +1036,7 @@ local function OnSlashCommand(msg)
 		else
 			Hark:Print("The panel is not available on this client.")
 		end
-	elseif cmd == "selftest" or cmd == "trace" then
+	elseif cmd == "selftest" or cmd == "trace" or cmd == "joindiag" then
 		if Hark.Diagnostics and type(Hark.Diagnostics.OnSlash) == "function" then
 			Hark.Diagnostics:OnSlash(cmd, rest)
 		else

@@ -537,7 +537,9 @@ local function BuildMessage(x, y, instance)
 	seq = seq + 1
 	if seq > SEQ_MAX then seq = 1 end
 	-- P1,<seq>,<guid>,<instance>,<x>,<y>,<zoneKey>,<layer>,<flags>
-	return string.format("%s,%d,%s,%s,%s,%s,%s,%d,%s", MSG_VERSION, seq, MyGUID() or "",
+	-- %.0f for the layer: it is a creature-GUID zoneUID fragment with no documented
+	-- bound, and this client's %d raises above 2^31. seq stays %d (wraps at SEQ_MAX).
+	return string.format("%s,%d,%s,%s,%s,%s,%s,%.0f,%s", MSG_VERSION, seq, MyGUID() or "",
 		sinst, sx, sy, tostring(zoneKey or 0), sendLayer, flags)
 end
 

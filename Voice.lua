@@ -29,11 +29,14 @@ local leftByHand = false
 local lastAutoJoin = 0
 local passTimer, nextPassAt = nil, 0
 local joinTimer = nil
+local joinedChannel = nil      -- channel id from a successful JOINED for our pending request, until active
+local loginWait = nil          -- { clubId, streamId, chanID, timer }: a request held until VOICE_CHAT_LOGIN
 local rejoinTimer = nil        -- delayed Join after a community change; cancelled by Leave
 local pendingJoin = nil        -- { key = "club:stream", untilT = t }: our latest request, until adopted or failed
 local abandoned = {}           -- ["club:stream"] = GetTime() expiry: join requests we gave up on
 local ignoredChannels = {}     -- [channelID] = expiry: channels from abandoned requests, never adopted
 local ABANDON_TTL = 15          -- seconds; also how long a timed-out request may still be adopted
+local LOGIN_WAIT = 5            -- seconds a request waits for VOICE_CHAT_LOGIN before it is sent anyway
 
 ---------------------------------------------------------------------------
 -- Protected API access
@@ -94,6 +97,111 @@ local function JoinKey(clubId, streamId)
 	return tostring(clubId) .. ":" .. tostring(streamId)
 end
 
+---------------------------------------------------------------------------
+-- Club and stream id forms
+---------------------------------------------------------------------------
+-- The Forever API docs type ClubId and ClubStreamId as numbers; Hark.db keeps
+-- them as strings, and a hand call with strings is known to work. Every call
+-- that takes them goes numeric first, and a lookup that returns nothing is
+-- retried with the strings. The saved representation never changes.
+
+-- The number form of an id, only when it converts exactly (a huge id that
+-- would lose digits as a double stays a string).
+local function NumericId(id)
+	if id == nil or Hark.IsSecret(id) then return nil end
+	local n = tonumber(id)
+	if n and n == math.floor(n) and tostring(n) == tostring(id) then return n end
+	return nil
+end
+
+local function IdAs(id, form)
+	if form == "number" then return NumericId(id) or id end
+	return id ~= nil and tostring(id) or nil
+end
+
+--- Forms to try, preferred first: { "number", "string" } or { "string" }.
+local function IdForms(...)
+	for i = 1, select("#", ...) do
+		if NumericId((select(i, ...))) then return { "number", "string" } end
+	end
+	return { "string" }
+end
+
+---------------------------------------------------------------------------
+-- Join log (CONTRACT.md 13): every step of a join, always kept
+---------------------------------------------------------------------------
+
+local JOINLOG_MAX = 40          -- HarkDB.joinlog entries, newest kept
+local WATCH_EXTRA = 5           -- seconds after the timeout that voice events still count
+local Typed = function(v) return Hark._diag.Typed(v) end
+
+-- Channel-level voice events are always logged; member-level ones (speaking
+-- fires constantly) only while a join is being watched.
+local CHANNEL_EVENTS = {
+	VOICE_CHAT_CHANNEL_JOINED = true, VOICE_CHAT_CHANNEL_ACTIVATED = true,
+	VOICE_CHAT_CHANNEL_DEACTIVATED = true, VOICE_CHAT_CHANNEL_REMOVED = true,
+	VOICE_CHAT_LOGIN = true, VOICE_CHAT_LOGOUT = true, VOICE_CHAT_ERROR = true,
+	VOICE_CHAT_PENDING_CHANNEL_JOIN_STATE = true, VOICE_CHAT_CONNECTION_SUCCESS = true,
+}
+
+local STATUS_NAMES = {}
+for name, code in pairs(STATUS) do
+	if type(code) == "number" then STATUS_NAMES[code] = name end
+end
+local function StatusText(code)
+	local p = Plain(code)
+	if p == nil then return Hark.IsSecret(code) and "<secret>" or "nil" end
+	return tostring(p) .. (STATUS_NAMES[p] and (" " .. STATUS_NAMES[p]) or "")
+end
+
+-- The join being watched: what Join saw and which voice events arrived since.
+-- { from, untilT, clubId, streamId, streamSource, loggedIn, requestForm, events = { "JOINED(0 Success)", ... } }
+local watch = nil
+
+local function JoinLog(step, fields)
+	local db = Hark.db
+	if not db then return end
+	local entry = { step = step }
+	local ok, now = pcall(GetTime)
+	if ok and type(now) == "number" and not Hark.IsSecret(now) then entry.t = math.floor(now * 1000 + 0.5) / 1000 end
+	if fields then for k, v in pairs(fields) do entry[k] = v end end
+	if type(db.joinlog) ~= "table" then db.joinlog = {} end
+	local buf = db.joinlog
+	buf[#buf + 1] = entry
+	while #buf > JOINLOG_MAX do table.remove(buf, 1) end
+	if Hark._diag.traceOn then
+		local row = { k = "join" }
+		for k, v in pairs(entry) do if k ~= "t" then row[k] = v end end
+		Hark._Trace(row)
+	end
+end
+
+--- Calls C_VoiceChat[name] or C_Club[name] with the ids in each form until one
+-- returns something. Returns the first non-nil result, the form that gave it,
+-- and the attempts { form, args, ret } for the log. extra: arguments after the ids.
+local function CallWithIdForms(api, name, ids, extra)
+	local attempts = {}
+	local lib = api == "C_Club" and C_Club or C_VoiceChat
+	if type(lib) ~= "table" or type(lib[name]) ~= "function" then
+		attempts[1] = { absent = true }
+		return nil, nil, attempts
+	end
+	local forms = IdForms(unpack(ids))
+	for _, form in ipairs(forms) do
+		local args = {}
+		for i, id in ipairs(ids) do args[i] = IdAs(id, form) end
+		for _, v in ipairs(extra or {}) do args[#args + 1] = v end
+		local okCall, ret = pcall(lib[name], unpack(args))
+		if not okCall then Hark._RecordError(api .. "." .. name, ret) end
+		local typedArgs = {}
+		for i, v in ipairs(args) do typedArgs[i] = Typed(v) end
+		attempts[#attempts + 1] = { form = form, args = typedArgs, ret = okCall and Typed(ret) or nil,
+			err = not okCall and Typed(ret) or nil }
+		if okCall and ret ~= nil then return ret, form, attempts end
+	end
+	return nil, nil, attempts
+end
+
 local function IsAbandoned(key)
 	local untilT = key and abandoned[key]
 	if not untilT then return false end
@@ -145,24 +253,29 @@ Voice.GetActiveChannelID = Voice.GetChannelID
 
 --- Stream to use for a club: the saved streamId, else the club's General
 -- stream, else "1" (the id the live test used).
-function Voice:ResolveStreamId(clubId)
-	if Hark.db.streamId then return Hark.db.streamId end
-	if clubId and C_Club and C_Club.GetStreams then
-		local ok, streams = pcall(C_Club.GetStreams, clubId)
-		if ok and type(streams) == "table" and not Hark.IsSecret(streams) then
-			local general = Enum and Enum.ClubStreamType and Enum.ClubStreamType.General or 0
-			local best
-			for _, s in ipairs(streams) do
-				local sType = type(s) == "table" and not Hark.IsSecret(s) and Plain(s.streamType)
-				local sId = sType ~= nil and Plain(s.streamId)
-				if sType == general and sId ~= nil and (not best or (tonumber(sId) or 0) < (tonumber(best) or 0)) then
-					best = sId
-				end
+-- Returns streamId (string), source ("saved", "general" or "fallback"), and
+-- the GetStreams attempts for the join log.
+local function Resolve(clubId)
+	local streams, _, attempts = nil, nil, nil
+	if clubId then streams, _, attempts = CallWithIdForms("C_Club", "GetStreams", { clubId }) end
+	if Hark.db.streamId then return Hark.db.streamId, "saved", attempts end
+	if type(streams) == "table" and not Hark.IsSecret(streams) then
+		local general = Enum and Enum.ClubStreamType and Enum.ClubStreamType.General or 0
+		local best
+		for _, s in ipairs(streams) do
+			local sType = type(s) == "table" and not Hark.IsSecret(s) and Plain(s.streamType)
+			local sId = sType ~= nil and Plain(s.streamId)
+			if sType == general and sId ~= nil and (not best or (tonumber(sId) or 0) < (tonumber(best) or 0)) then
+				best = sId
 			end
-			if best then return tostring(best) end
 		end
+		if best then return tostring(best), "general", attempts end
 	end
-	return "1"
+	return "1", "fallback", attempts
+end
+
+function Voice:ResolveStreamId(clubId)
+	return (Resolve(clubId))
 end
 
 local function IsOurChannel(channel)
@@ -170,6 +283,19 @@ local function IsOurChannel(channel)
 	local clubId = Hark.db.communityId
 	if not clubId or not SameId(channel.clubId, clubId) then return false end
 	return SameId(channel.streamId, Voice:ResolveStreamId(clubId))
+end
+
+local function ChannelIDOf(channel)
+	if type(channel) ~= "table" or Hark.IsSecret(channel) then return nil end
+	return Plain(channel.channelID)
+end
+
+-- Active the way Blizzard's own voice button decides it: the client's active
+-- channel id is this channel. The struct's isActive is accepted as well.
+local function IsChannelActive(channel, id)
+	if id == nil then return false end
+	if type(channel) == "table" and not Hark.IsSecret(channel) and Plain(channel.isActive) == true then return true end
+	return SameId(Call("GetActiveChannelID"), id)
 end
 
 --- Communities the player belongs to: array of { clubId = string, name = string, clubType = number }.
@@ -442,6 +568,11 @@ local function CancelRejoin()
 	rejoinTimer = nil
 end
 
+local function CancelLoginWait()
+	if loginWait and loginWait.timer then loginWait.timer:Cancel() end
+	loginWait = nil
+end
+
 -- A join we started is no longer wanted (Leave, community change). Its result
 -- may still arrive; when it does, the channel is left instead of adopted.
 local function AbandonPendingJoin()
@@ -449,6 +580,8 @@ local function AbandonPendingJoin()
 		abandoned[pendingJoin.key] = GetTime() + ABANDON_TTL
 	end
 	pendingJoin = nil
+	joinedChannel = nil
+	CancelLoginWait()
 end
 
 -- Leave a channel that an abandoned request produced.
@@ -460,12 +593,16 @@ end
 
 local function Adopt(id)
 	CancelJoinTimer()
+	CancelLoginWait()
 	pendingJoin = nil
+	joinedChannel = nil
+	if watch then watch.untilT = math.min(watch.untilT, GetTime()) end
 	if channelID ~= id then
 		wipe(memberGUIDs)
 		wipe(members)
 	end
 	channelID = id
+	JoinLog("adopt", { channelID = Typed(id) })
 	SetState("active")
 	Hark:Print("Joined proximity voice.")
 	Voice:RequestPass(0)
@@ -485,61 +622,190 @@ local function Detach(message)
 	Hark:Fire("MEMBERS_UPDATED")
 end
 
+-- Starts the join itself: activate a channel the client already holds, else
+-- request the community stream channel (numeric ids first, see IdForms).
+local function SendRequest(clubId, streamId, chanID)
+	if chanID then
+		Call("ActivateChannel", chanID)
+		if watch then watch.requestForm = "ActivateChannel" end
+		JoinLog("activate", { call = "ActivateChannel", args = { Typed(chanID) } })
+		return
+	end
+	local fn = C_VoiceChat and C_VoiceChat.RequestJoinAndActivateCommunityStreamChannel
+	if type(fn) ~= "function" then
+		JoinLog("request", { call = "RequestJoinAndActivateCommunityStreamChannel", absent = true })
+		return
+	end
+	-- Returns nothing; the outcome arrives as VOICE_CHAT_CHANNEL_JOINED / ACTIVATED.
+	-- Only an error can tell that a form was refused, so only an error moves on to the next form.
+	for _, form in ipairs(IdForms(clubId, streamId)) do
+		local c, s = IdAs(clubId, form), IdAs(streamId, form)
+		local ok, err = pcall(fn, c, s)
+		if not ok then Hark._RecordError("C_VoiceChat.RequestJoinAndActivateCommunityStreamChannel", err) end
+		JoinLog("request", { call = "RequestJoinAndActivateCommunityStreamChannel", form = form,
+			args = { Typed(c), Typed(s) }, ok = ok, err = not ok and Typed(err) or nil })
+		if watch then watch.requestForm = form .. (ok and "" or " (error)") end
+		if ok then return end
+	end
+end
+
+-- Up to three chat lines saying what the join saw, for the timeout.
+local function Diagnosis(ch, id, active)
+	local w = watch or { events = {} }
+	local lines = {}
+	lines[1] = string.format("Could not join community %s voice: stream %s (%s), sent as %s.",
+		tostring(w.clubId), tostring(w.streamId), tostring(w.streamSource), tostring(w.requestForm or "nothing"))
+	local logged = (w.loggedIn == true and "yes") or (w.loggedIn == false and "no") or "unknown"
+	local evs = w.events
+	local list = "none"
+	if #evs > 0 then
+		list = #evs .. ": " .. table.concat(evs, ", ", 1, math.min(#evs, 6)) .. (#evs > 6 and ", ..." or "")
+	end
+	lines[2] = "Voice logged in: " .. logged .. ". Voice events in " .. JOIN_TIMEOUT .. " s: " .. list .. "."
+	local lookup = "nothing"
+	if id then
+		lookup = "channel " .. tostring(id) .. (IsChannelActive(ch, id) and ", active" or ", not active")
+	elseif ch ~= nil then
+		lookup = "a value with no channel id"
+	end
+	active = Plain(active)
+	lines[3] = "Channel lookup: " .. lookup .. "; active channel: " .. tostring(active or "none")
+		.. ". /hark joindiag, then /reload, saves the full record."
+	return lines
+end
+
+-- The join timed out: one last look before giving up, then say what was seen.
+local function OnJoinTimeout(clubId, streamId)
+	joinTimer = nil
+	if state ~= "joining" then return end
+	CancelLoginWait()
+	local ch, form, attempts = CallWithIdForms("C_VoiceChat", "GetChannelForCommunityStream", { clubId, streamId })
+	local id = ChannelIDOf(ch)
+	local active = Plain(Call("GetActiveChannelID"))
+	local adopt, decision
+	if id and IsChannelActive(ch, id) then
+		adopt, decision = id, "adopt: the lookup channel is active"
+	elseif joinedChannel ~= nil and SameId(active, joinedChannel) then
+		adopt, decision = joinedChannel, "adopt: the channel from our JOINED event is active"
+	elseif active ~= nil and not IsIgnoredChannel(active) and IsOurChannel(Call("GetChannel", active)) then
+		adopt, decision = active, "adopt: the active channel is our club and stream"
+	else
+		decision = "failed"
+	end
+	local events = {}
+	for i, e in ipairs(watch and watch.events or {}) do events[i] = e end
+	JoinLog("timeout", { decision = decision, form = form, attempts = attempts, channelID = Typed(id),
+		activeChannelID = Typed(active), joinedChannel = Typed(joinedChannel), events = events })
+	if adopt ~= nil then
+		Adopt(adopt)
+		return
+	end
+	-- pendingJoin stays for a while: a late success is still adopted
+	-- unless the player leaves or switches community first.
+	SetState("idle")
+	for _, line in ipairs(Diagnosis(ch, id, active)) do Hark:Print(line) end
+end
+
 --- Join (and activate) the configured community voice stream.
 -- Returns true when a join was started or we are already in, else false plus a message.
+-- Every step is recorded in HarkDB.joinlog (CONTRACT.md 13).
 function Voice:Join()
 	if not Hark.db then return false, "Not loaded yet." end
-	if not self:IsAvailable() then return false, "Voice chat is not available on this client." end
+	if not self:IsAvailable() then
+		JoinLog("join", { outcome = "voice API not available" })
+		return false, "Voice chat is not available on this client."
+	end
 	local clubId = Hark.db.communityId
-	if not clubId then return false, "No community configured. Use /hark communities, then /hark setcommunity <id>." end
+	if not clubId then
+		JoinLog("join", { outcome = "no community configured" })
+		return false, "No community configured. Use /hark communities, then /hark setcommunity <id>."
+	end
 	leftByHand = false
 	CancelRejoin()
-	if self:IsActive() then return true end
+	if self:IsActive() then
+		JoinLog("join", { outcome = "already active", channelID = Typed(channelID) })
+		return true
+	end
 
-	local streamId = self:ResolveStreamId(clubId)
+	local streamId, streamSource, streamAttempts = Resolve(clubId)
 	local key = JoinKey(clubId, streamId)
 	-- One request at a time: a second Join while the first is in flight would
 	-- send a duplicate request and restart the timeout.
-	if state == "joining" and pendingJoin and pendingJoin.key == key then return true end
+	if state == "joining" and pendingJoin and pendingJoin.key == key then
+		JoinLog("join", { outcome = "already joining", clubId = Typed(clubId), streamId = Typed(streamId) })
+		return true
+	end
 	if pendingJoin and pendingJoin.key ~= key then AbandonPendingJoin() end
 	abandoned[key] = nil -- wanted again: a late result for it may be adopted
 
-	if Plain(Call("IsLoggedIn")) == false then Call("Login") end
+	local now = GetTime()
+	watch = { from = now, untilT = now + JOIN_TIMEOUT + WATCH_EXTRA, clubId = clubId, streamId = streamId,
+		streamSource = streamSource, events = {} }
+	JoinLog("join", { clubId = Typed(clubId), streamId = Typed(streamId), savedStreamId = Typed(Hark.db.streamId), state = state })
+	JoinLog("resolveStream", { result = Typed(streamId), source = streamSource, getStreams = streamAttempts })
 
-	local channel = Call("GetChannelForCommunityStream", clubId, streamId)
-	local chanID = type(channel) == "table" and not Hark.IsSecret(channel) and Plain(channel.channelID) or nil
+	local loggedIn = Call("IsLoggedIn")
+	watch.loggedIn = Plain(loggedIn)
+	JoinLog("isLoggedIn", { ret = Typed(loggedIn) })
+	local waitForLogin = false
+	if Plain(loggedIn) == false then
+		local status = Call("Login")
+		JoinLog("login", { ret = Typed(status), status = StatusText(status) })
+		-- Blizzard's ChannelFrame holds a voice request until VOICE_CHAT_LOGIN
+		-- whenever it had to log in first; a request sent meanwhile is lost.
+		waitForLogin = Plain(status) ~= STATUS_SUCCESS
+	end
+
+	local channel, lookupForm, lookupAttempts = CallWithIdForms("C_VoiceChat", "GetChannelForCommunityStream", { clubId, streamId })
+	local chanID = ChannelIDOf(channel)
+	JoinLog("lookup", { form = lookupForm, attempts = lookupAttempts, channelID = Typed(chanID),
+		activeChannelID = Typed(Call("GetActiveChannelID")) })
 	if chanID then
 		ignoredChannels[chanID] = nil
-		if Plain(channel.isActive) then
+		if IsChannelActive(channel, chanID) then
 			Adopt(chanID)
 			return true
 		end
-		Call("ActivateChannel", chanID)
-	else
-		-- Returns nothing; the outcome arrives as VOICE_CHAT_CHANNEL_JOINED / ACTIVATED.
-		Call("RequestJoinAndActivateCommunityStreamChannel", clubId, streamId)
 	end
 
-	pendingJoin = { key = key, untilT = GetTime() + JOIN_TIMEOUT + ABANDON_TTL }
+	pendingJoin = { key = key, untilT = now + JOIN_TIMEOUT + ABANDON_TTL }
+	joinedChannel = nil
 	SetState("joining")
+	CancelLoginWait()
+	if waitForLogin then
+		local lw = { clubId = clubId, streamId = streamId, chanID = chanID }
+		loginWait = lw
+		lw.timer = C_Timer.NewTimer(LOGIN_WAIT, function()
+			if loginWait ~= lw then return end
+			loginWait = nil
+			if state ~= "joining" then return end
+			JoinLog("loginWait", { outcome = "no VOICE_CHAT_LOGIN within " .. LOGIN_WAIT .. " s, requesting anyway" })
+			SendRequest(lw.clubId, lw.streamId, lw.chanID)
+		end)
+		JoinLog("loginWait", { outcome = "waiting for VOICE_CHAT_LOGIN" })
+	else
+		SendRequest(clubId, streamId, chanID)
+	end
 	CancelJoinTimer()
-	joinTimer = C_Timer.NewTimer(JOIN_TIMEOUT, function()
-		joinTimer = nil
-		if state == "joining" then
-			-- The request may have completed without an event we recognised.
-			local ch = Call("GetChannelForCommunityStream", clubId, streamId)
-			local id = type(ch) == "table" and not Hark.IsSecret(ch) and Plain(ch.channelID) or nil
-			if id and Plain(ch.isActive) then
-				Adopt(id)
-			else
-				-- pendingJoin stays for a while: a late success is still adopted
-				-- unless the player leaves or switches community first.
-				SetState("idle")
-				Hark:Print("Could not join the community voice channel. Check that the community has voice enabled.")
-			end
-		end
-	end)
+	joinTimer = C_Timer.NewTimer(JOIN_TIMEOUT, function() OnJoinTimeout(clubId, streamId) end)
 	return true
+end
+
+-- VOICE_CHAT_LOGIN while a join waits for it: send the held request.
+local function OnVoiceLogin(status)
+	local lw = loginWait
+	if not lw then return end
+	CancelLoginWait()
+	if state ~= "joining" then return end
+	if status == nil or Plain(status) == STATUS_SUCCESS then
+		SendRequest(lw.clubId, lw.streamId, lw.chanID)
+		return
+	end
+	CancelJoinTimer()
+	pendingJoin = nil
+	SetState("idle")
+	JoinLog("loginFailed", { status = StatusText(status) })
+	Hark:Print("Voice chat login failed (status " .. StatusText(status) .. ").")
 end
 
 --- Leave the community voice channel. Restores every volume first.
@@ -617,15 +883,48 @@ end
 -- Events
 ---------------------------------------------------------------------------
 
+-- Every VOICE_CHAT_* event goes to the join log before anything else looks at
+-- it: channel-level ones always, member-level ones while a join is watched.
+-- Returns the index of the first secret argument, if any.
+local WATCH_EVENTS_MAX = 30
+local function NoteVoiceEvent(event, ...)
+	if type(event) ~= "string" or event:sub(1, 11) ~= "VOICE_CHAT_" then return nil end
+	local n = select("#", ...)
+	local secretAt
+	for i = 1, n do
+		if Hark.IsSecret((select(i, ...))) then secretAt = i break end
+	end
+	local watching = watch ~= nil and GetTime() <= watch.untilT
+	if not (CHANNEL_EVENTS[event] or watching) then return secretAt end
+	local args = { n = n }
+	for i = 1, n do args[i] = Typed((select(i, ...))) end
+	JoinLog("event", { event = event, args = args,
+		dropped = secretAt and "secret value guard" or nil, secretArg = secretAt })
+	if watching and #watch.events < WATCH_EVENTS_MAX then
+		local label = event:sub(12)
+		if event == "VOICE_CHAT_CHANNEL_JOINED" or event == "VOICE_CHAT_LOGIN" then
+			label = label .. "(" .. StatusText((...)) .. ")"
+		elseif event == "VOICE_CHAT_ERROR" then
+			label = label .. "(" .. StatusText((select(2, ...))) .. ")"
+		end
+		if secretAt then label = label .. "[dropped: arg " .. secretAt .. " secret]" end
+		watch.events[#watch.events + 1] = label
+	end
+	return secretAt
+end
+
 local function OnEvent(_, event, ...)
+	NoteVoiceEvent(event, ...)
 	-- Event payloads come from the client: ignore any carrying a secret value
 	-- (it could not be compared or used as a key anyway).
 	for i = 1, select("#", ...) do
 		if Hark.IsSecret((select(i, ...))) then return end
 	end
 	if event == "VOICE_CHAT_CHANNEL_JOINED" then
+		-- Payload (Forever 1.60.1 docs): status, channelID, channelType, clubId (nilable), streamId (nilable).
 		local status, id, _, clubId, streamId = ...
-		if clubId == nil or streamId == nil then return end
+		local function Decide(decision) JoinLog("joinedDecision", { decision = decision }) end
+		if clubId == nil or streamId == nil then Decide("ignored: no clubId or streamId in the payload") return end
 		local key = JoinKey(clubId, streamId)
 		if IsAbandoned(key) then
 			-- The result of a join we gave up on (left, switched community, timed out).
@@ -633,23 +932,40 @@ local function OnEvent(_, event, ...)
 				abandoned[key] = nil
 				if id and id ~= channelID then DropChannel(id) end
 			end
+			Decide("abandoned request " .. key .. ": channel dropped")
 			return
 		end
-		if not SameId(clubId, Hark.db.communityId) then return end
-		if not SameId(streamId, Voice:ResolveStreamId(clubId)) then return end
+		if not SameId(clubId, Hark.db.communityId) then
+			Decide("ignored: club " .. tostring(clubId) .. " is not " .. tostring(Hark.db.communityId))
+			return
+		end
+		local wanted = Voice:ResolveStreamId(clubId)
+		if not SameId(streamId, wanted) then
+			Decide("ignored: stream " .. tostring(streamId) .. " is not " .. tostring(wanted))
+			return
+		end
 		if status ~= STATUS_SUCCESS then
 			-- Only a join we are waiting for can fail; a stray failure (e.g. the
 			-- user retrying in the Communities window) must not drop an active channel.
-			if state ~= "joining" then return end
+			if state ~= "joining" then Decide("ignored: failure status " .. StatusText(status) .. " while not joining") return end
 			CancelJoinTimer()
+			CancelLoginWait()
 			pendingJoin = nil
 			SetState("idle")
-			Hark:Print("Joining community voice failed (status " .. tostring(status) .. ").")
+			Decide("failed: status " .. StatusText(status))
+			Hark:Print("Joining community voice failed (status " .. StatusText(status) .. ").")
 			return
 		end
-		if not id then return end
-		local channel = Call("GetChannel", id)
-		if type(channel) == "table" and not Hark.IsSecret(channel) and Plain(channel.isActive) then Adopt(id) end
+		if not id then Decide("ignored: success without a channel id") return end
+		if IsChannelActive(Call("GetChannel", id), id) then
+			Decide("adopted: channel " .. tostring(id) .. " is active")
+			Adopt(id)
+		else
+			-- Activation follows as VOICE_CHAT_CHANNEL_ACTIVATED; remember the id so
+			-- that event is matched by id, not by re-reading clubId/streamId.
+			if pendingJoin then joinedChannel = id end
+			Decide("joined channel " .. tostring(id) .. ", waiting for activation")
+		end
 	elseif event == "VOICE_CHAT_CHANNEL_ACTIVATED" then
 		local id = ...
 		if id == nil then return end
@@ -658,10 +974,27 @@ local function OnEvent(_, event, ...)
 			Call("DeactivateChannel", id)
 			return
 		end
-		if IsOurChannel(Call("GetChannel", id)) then Adopt(id) end
+		if joinedChannel ~= nil and SameId(id, joinedChannel) then
+			JoinLog("activatedDecision", { decision = "adopted: channel " .. tostring(id) .. " from our JOINED" })
+			Adopt(id)
+			return
+		end
+		local channel = Call("GetChannel", id)
+		if IsOurChannel(channel) then
+			JoinLog("activatedDecision", { decision = "adopted: GetChannel matches our club and stream" })
+			Adopt(id)
+		else
+			JoinLog("activatedDecision", { decision = "ignored: GetChannel(" .. tostring(id) .. ") is not our club and stream",
+				channel = Typed(channel) })
+		end
+	elseif event == "VOICE_CHAT_LOGIN" then
+		OnVoiceLogin((...))
 	elseif event == "VOICE_CHAT_CHANNEL_DEACTIVATED" or event == "VOICE_CHAT_CHANNEL_REMOVED" then
 		local id = ...
-		if event == "VOICE_CHAT_CHANNEL_REMOVED" and id ~= nil then ignoredChannels[id] = nil end
+		if event == "VOICE_CHAT_CHANNEL_REMOVED" and id ~= nil then
+			ignoredChannels[id] = nil
+			if joinedChannel ~= nil and SameId(id, joinedChannel) then joinedChannel = nil end
+		end
 		if id ~= nil and id == channelID then
 			-- Something else (the player, another channel) took voice: do not auto-join back over it.
 			leftByHand = true
@@ -672,7 +1005,7 @@ local function OnEvent(_, event, ...)
 	elseif event == "VOICE_CHAT_ERROR" then
 		local platformCode, statusCode = ...
 		if state == "joining" then
-			Hark:Print(string.format("Voice error %s (%s).", tostring(statusCode), tostring(platformCode)))
+			Hark:Print(string.format("Voice error %s (platform code %s).", StatusText(statusCode), tostring(platformCode)))
 		end
 	elseif event == "VOICE_CHAT_CHANNEL_MEMBER_REMOVED" then
 		local memberID, id = ...
@@ -723,6 +1056,10 @@ function Voice:Init()
 		"VOICE_CHAT_CHANNEL_MEMBER_SPEAKING_STATE_CHANGED",
 		"VOICE_CHAT_LOGOUT",
 		"VOICE_CHAT_ERROR",
+		-- Observed for the join log (VOICE_CHAT_LOGIN also releases a held request).
+		"VOICE_CHAT_LOGIN",
+		"VOICE_CHAT_PENDING_CHANNEL_JOIN_STATE",
+		"VOICE_CHAT_CONNECTION_SUCCESS",
 		"PLAYER_STARTED_MOVING",
 		"PLAYER_STOPPED_MOVING",
 		"ZONE_CHANGED_NEW_AREA",
@@ -884,6 +1221,51 @@ function Voice._SelfTest(D)
 		end
 	end
 	return out
+end
+
+--- Pre-join facts for /hark joindiag: everything the join depends on, read
+-- now, as typed plain data (secrets recorded as "<secret>"). Changes nothing.
+function Voice._JoinFacts()
+	local f = { state = state, channelID = Typed(channelID), joinedChannel = Typed(joinedChannel),
+		waitingForLogin = loginWait ~= nil, apiAvailable = Voice:IsAvailable() }
+	local vc = C_VoiceChat
+	local function Fact(name, ...)
+		if type(vc) ~= "table" or type(vc[name]) ~= "function" then return { absent = true } end
+		local ok, ret = pcall(vc[name], ...)
+		if not ok then return { err = Typed(ret) } end
+		return Typed(ret)
+	end
+	for _, name in ipairs({ "IsEnabled", "CanPlayerUseVoiceChat", "IsLoggedIn", "IsVoiceChatConnected",
+		"GetCurrentVoiceChatConnectionStatusCode", "GetActiveChannelID", "GetActiveChannelType", "IsMuted", "IsDeafened" }) do
+		f[name] = Fact(name)
+	end
+	local active = Plain(vc and type(vc.GetActiveChannelID) == "function" and Call("GetActiveChannelID") or nil)
+	if active ~= nil then f.activeChannel = Fact("GetChannel", active) end
+	local db = Hark.db
+	local clubId = db and db.communityId
+	f.communityId, f.savedStreamId = Typed(clubId), Typed(db and db.streamId)
+	if not clubId then return f end
+	local streamId, source, attempts = Resolve(clubId)
+	f.resolvedStreamId, f.streamSource, f.getStreams = Typed(streamId), source, attempts
+	local _, form, lookup = CallWithIdForms("C_VoiceChat", "GetChannelForCommunityStream", { clubId, streamId })
+	f.lookupForm, f.lookup = form, lookup
+	_, _, f.joinClubError = CallWithIdForms("C_VoiceChat", "GetJoinClubVoiceChannelError", { clubId })
+	local communities = Enum and Enum.ChatChannelType and Enum.ChatChannelType.Communities or 4
+	local fn = vc and vc.IsChannelJoinPending
+	if type(fn) == "function" then
+		local forms = IdForms(clubId, streamId)
+		local ok, ret = pcall(fn, communities, IdAs(clubId, forms[1]), IdAs(streamId, forms[1]))
+		f.joinPending = { channelType = communities, form = forms[1], ret = ok and Typed(ret) or nil, err = not ok and Typed(ret) or nil }
+	else
+		f.joinPending = { absent = true }
+	end
+	_, _, f.clubInfo = CallWithIdForms("C_Club", "GetClubInfo", { clubId })
+	local listed = false
+	for _, c in ipairs(Voice:ListCommunities()) do
+		if SameId(c.clubId, clubId) then listed = true end
+	end
+	f.subscribed = listed
+	return f
 end
 
 ns.Voice = Voice
